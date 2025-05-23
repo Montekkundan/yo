@@ -1,4 +1,6 @@
-# yo
+# yo experiment
+
+# NOTE: ALL ACTIVE DEVELOPMENT: https://github.com/lershi-devlabs/yo
 
 Ask your terminal anything using AI (OpenAI or Ollama).
 
