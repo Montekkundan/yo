@@ -1,7 +1,5 @@
 # yo experiment
 
-# NOTE: ALL ACTIVE DEVELOPMENT: https://github.com/lershi-devlabs/yo
-
 Ask your terminal anything using AI (OpenAI or Ollama).
 
 ## Features
@@ -19,8 +17,8 @@ Precompiled binaries for macOS, Linux, and Windows are available on the [Release
 You can install `yo` using Homebrew:
 
 ```sh
-brew tap lershi-devlabs/yo https://github.com/lershi-devlabs/yo.git
-brew install lershi-devlabs/yo/yo-bin
+brew tap Montekkundan/yo https://github.com/Montekkundan/yo.git
+brew install Montekkundan/yo/yo-bin
 ```
 
 ### Cargo (Rust)
@@ -34,7 +32,7 @@ cargo install yo
 Clone the repository and build with Cargo:
 
 ```sh
-git clone https://github.com/lershi-devlabs/yo.git
+git clone https://github.com/Montekkundan/yo.git
 cd yo
 cargo install --path .
 ```
