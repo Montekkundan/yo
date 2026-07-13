@@ -40,5 +40,5 @@ jobs:
           git config user.email "github-actions@github.com"
           git add yo.json
           git commit -m "Update yo to $VERSION"
-          git remote set-url origin https://$SCOOP_PUSH_TOKEN@github.com/lershi-devlabs/scoop-bucket.git
-          git push origin main 
+          git remote set-url origin https://$SCOOP_PUSH_TOKEN@github.com/Montekkundan/scoop-bucket.git
+          git push origin main

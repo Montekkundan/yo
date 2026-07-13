@@ -42,5 +42,5 @@ jobs:
           git config user.email "github-actions@github.com"
           git add PKGBUILD
           git commit -m "Update PKGBUILD for $VERSION"
-          git remote set-url origin https://$AUR_PUSH_TOKEN@github.com/lershi-devlabs/yo-bin-aur.git
-          git push origin main 
+          git remote set-url origin https://$AUR_PUSH_TOKEN@github.com/Montekkundan/yo-bin-aur.git
+          git push origin main
