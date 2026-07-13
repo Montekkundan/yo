@@ -19,8 +19,8 @@ Precompiled binaries for macOS, Linux, and Windows are available on the [Release
 You can install `yo` using Homebrew:
 
 ```sh
-brew tap montekkundan/yo https://github.com/montekkundan/yo.git
-brew install montekkundan/yo/yo-bin
+brew tap lershi-devlabs/yo https://github.com/lershi-devlabs/yo.git
+brew install lershi-devlabs/yo/yo-bin
 ```
 
 ### Cargo (Rust)
@@ -34,7 +34,7 @@ cargo install yo
 Clone the repository and build with Cargo:
 
 ```sh
-git clone https://github.com/montekkundan/yo.git
+git clone https://github.com/lershi-devlabs/yo.git
 cd yo
 cargo install --path .
 ```
@@ -70,13 +70,12 @@ The tool supports configuration for different AI backends (OpenAI, Ollama). See 
 To push your changes to GitHub, use the following steps:
 
 ```sh
+git pull
 git add .
-git commit -m "changes here"
-git tag v1.0.0   # necessary when new version is released
-# replace v1.0.0 with the version you are releasing
-git push
-# To push tags as well:
-git push --tags
+git commit -m "chore: bump version to x.y.z"
+git tag 1.0.0   # necessary when new version is released
+# replace 1.0.0 with the version you are releasing
+git push origin master --tags
 ```
 
 ## Changelog

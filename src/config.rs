@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 
 /// Resolve $XDG_CONFIG_HOME or fallback to ~/.config
@@ -44,18 +42,5 @@ pub fn save_config(cfg: &Config) {
     let path = get_config_path();
     let toml = toml::to_string_pretty(cfg).unwrap();
     fs::write(&path, toml).unwrap();
-}
-
-pub fn get_history_path() -> PathBuf {
-    let dir = base_dir().join("yo");
-    fs::create_dir_all(&dir).unwrap();
-    dir.join("history.txt")
-}
-
-pub fn append_history(entry: &str) {
-    let path = get_history_path();
-    
-    let mut f = OpenOptions::new().create(true).append(true).open(&path).unwrap();
-    writeln!(f, "{}", entry).unwrap();
 }
 

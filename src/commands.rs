@@ -1,4 +1,4 @@
-use crate::config::{append_history, get_config_path, load_or_create_config, save_config, Config, get_history_path};
+use crate::config::{get_config_path, load_or_create_config, save_config, Config};
 use prettytable::{Table, Row, Cell};
 use reqwest::Client;
 use serde_json::Value;
@@ -8,10 +8,16 @@ use std::fs;
 use async_trait::async_trait;
 use anyhow::Result;
 use futures_util::StreamExt;
+use crate::db::init_db;
 
 #[async_trait]
 pub trait AIProvider {
-    async fn ask(&self, prompt: &str) -> Result<String>;
+    async fn ask_openai(&self, _messages: Vec<serde_json::Value>) -> Result<String> {
+        Err(anyhow::anyhow!("Not implemented"))
+    }
+    async fn ask_ollama(&self, _prompt: &str) -> Result<String> {
+        Err(anyhow::anyhow!("Not implemented"))
+    }
 }
 
 pub struct OpenAIProvider {
@@ -21,13 +27,7 @@ pub struct OpenAIProvider {
 
 #[async_trait]
 impl AIProvider for OpenAIProvider {
-    async fn ask(&self, prompt: &str) -> Result<String> {
-        let mut messages = Vec::new();
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": "You are a helpful AI assistant."
-        }));
-        messages.push(serde_json::json!({"role": "user", "content": prompt.to_string()}));
+    async fn ask_openai(&self, messages: Vec<serde_json::Value>) -> Result<String> {
         let client = reqwest::Client::new();
         let body = serde_json::json!({
             "model": self.model,
@@ -48,7 +48,6 @@ impl AIProvider for OpenAIProvider {
             return Ok(String::new());
         }
         let mut stream = res.bytes_stream();
-        use std::io::Write;
         let mut got_content = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -65,7 +64,7 @@ impl AIProvider for OpenAIProvider {
                         }
                     }
                 } else if !line.is_empty() {
-                    eprintln!("OpenAI stream: {}", String::from_utf8_lossy(line));
+                    // Silently ignore non-content lines (do not print raw OpenAI stream lines)
                 }
             }
         }
@@ -83,15 +82,15 @@ pub struct OllamaProvider {
 
 #[async_trait]
 impl AIProvider for OllamaProvider {
-    async fn ask(&self, prompt: &str) -> Result<String> {
+    async fn ask_ollama(&self, prompt: &str) -> Result<String> {
         use std::process::Command;
-        // Directly spawn the ollama process and let it inherit the terminal
-        let status = Command::new("ollama")
+        let output = Command::new("ollama")
             .arg("run")
             .arg(&self.model)
             .arg(prompt)
-            .status()?;
-        Ok(format!("Ollama exited with status: {}", status))
+            .output()?;
+        let response = String::from_utf8_lossy(&output.stdout).to_string();
+        Ok(response)
     }
 }
 
@@ -102,10 +101,16 @@ pub enum Provider {
 
 #[async_trait]
 impl AIProvider for Provider {
-    async fn ask(&self, prompt: &str) -> Result<String> {
+    async fn ask_openai(&self, messages: Vec<serde_json::Value>) -> Result<String> {
         match self {
-            Provider::OpenAI(p) => p.ask(prompt).await,
-            Provider::Ollama(p) => p.ask(prompt).await,
+            Provider::OpenAI(p) => p.ask_openai(messages).await,
+            _ => Err(anyhow::anyhow!("Not OpenAI provider")),
+        }
+    }
+    async fn ask_ollama(&self, prompt: &str) -> Result<String> {
+        match self {
+            Provider::Ollama(p) => p.ask_ollama(prompt).await,
+            _ => Err(anyhow::anyhow!("Not Ollama provider")),
         }
     }
 }
@@ -155,15 +160,18 @@ fn fetch_ollama_local() -> Vec<String> {
 
 /// Clear the conversation history
 pub fn clear_history() {
-    let path = get_history_path();
-    if path.exists() {
-        if let Err(e) = fs::write(&path, "") {
-            eprintln!("Failed to clear history: {}", e);
-        } else {
-            println!("✅ History cleared");
-        }
+    let chat_id = match get_current_chat_id() {
+        Some(id) => id,
+        None => { eprintln!("No current chat selected. Start or switch to a chat first."); return; }
+    };
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    if let Err(e) = conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id]) {
+        eprintln!("Failed to clear history: {}", e);
     } else {
-        println!("No history file found to clear.");
+        println!("✅ Cleared history for current chat");
     }
 }
 
@@ -320,28 +328,82 @@ pub async fn list_models() {
 
 /// Ask current model; for Ollama, use ollama run and exit with /bye
 pub async fn ask(question: &[String]) {
-    let cfg = load_or_create_config();
-    let prompt = question.join(" ");
-
-    let provider = if cfg.source == "openai" {
-        Provider::OpenAI(OpenAIProvider {
-            model: cfg.model.clone(),
-            api_key: cfg.openai_api_key.clone().unwrap(),
-        })
-    } else {
-        Provider::Ollama(OllamaProvider {
-            model: cfg.model.clone(),
-        })
+    let chat_id = match get_current_chat_id() {
+        Some(id) => id,
+        None => { eprintln!("No current chat selected. Start or switch to a chat first."); return; }
     };
-
-    match provider.ask(&prompt).await {
-        Ok(response) => {
-            println!("{}", response);
-            append_history(&format!("Q: {}\nA: {}", prompt, response));
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let prompt = question.join(" ");
+    // Store user message
+    let _ = conn.execute(
+        "INSERT INTO messages (chat_id, role, content) VALUES (?1, 'user', ?2)",
+        (&chat_id, &prompt),
+    );
+    let cfg = load_or_create_config();
+    // Fetch full chat history for context
+    let mut stmt = conn.prepare("SELECT role, content FROM messages WHERE chat_id = ?1 ORDER BY created_at ASC").unwrap();
+    let history: Vec<(String, String)> = stmt
+        .query_map([chat_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .flatten()
+        .collect();
+    match cfg.source.as_str() {
+        "openai" => {
+            let mut messages = vec![serde_json::json!({
+                "role": "system",
+                "content": "You are a helpful AI assistant."
+            })];
+            for (role, content) in &history {
+                messages.push(serde_json::json!({"role": role, "content": content}));
+            }
+            messages.push(serde_json::json!({"role": "user", "content": &prompt}));
+            let provider = Provider::OpenAI(OpenAIProvider {
+                model: cfg.model.clone(),
+                api_key: cfg.openai_api_key.clone().unwrap(),
+            });
+            match provider.ask_openai(messages).await {
+                Ok(response) => {
+                    let _ = conn.execute(
+                        "INSERT INTO messages (chat_id, role, content) VALUES (?1, 'assistant', ?2)",
+                        (&chat_id, &response),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error during AI call: {}", e);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("Error during AI call: {}", e);
+        "ollama" => {
+            let mut full_prompt = String::new();
+            for (role, content) in &history {
+                let who = match role.as_str() {
+                    "user" => "User",
+                    "assistant" => "AI",
+                    _ => role.as_str(),
+                };
+                full_prompt.push_str(&format!("{}: {}\n", who, content));
+            }
+            full_prompt.push_str(&format!("User: {}\n", &prompt));
+            let provider = Provider::Ollama(OllamaProvider {
+                model: cfg.model.clone(),
+            });
+            match provider.ask_ollama(&full_prompt).await {
+                Ok(response) => {
+                    println!("{}", response);
+                    let _ = conn.execute(
+                        "INSERT INTO messages (chat_id, role, content) VALUES (?1, 'assistant', ?2)",
+                        (&chat_id, &response),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error during AI call: {}", e);
+                }
+            }
         }
+        _ => eprintln!("Unknown backend: {}", cfg.source),
     }
 }
 
@@ -386,5 +448,241 @@ pub fn show_current() {
     }
     
     println!("\n💡 Use 'yo list' to see all available models");
+}
+
+const CURRENT_CHAT_FILE: &str = "current_chat";
+
+fn set_current_chat_id(chat_id: i64) {
+    let config_dir = dirs::home_dir().unwrap().join(".config").join("yo");
+    let file_path = config_dir.join(CURRENT_CHAT_FILE);
+    let _ = fs::write(file_path, chat_id.to_string());
+}
+
+fn get_current_chat_id() -> Option<i64> {
+    let config_dir = dirs::home_dir().unwrap().join(".config").join("yo");
+    let file_path = config_dir.join(CURRENT_CHAT_FILE);
+    if let Ok(s) = fs::read_to_string(file_path) {
+        s.trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+pub fn new_chat(title: Option<String>) {
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let title = title.unwrap_or_else(|| "New Chat".to_string());
+    let res = conn.execute(
+        "INSERT INTO chats (title) VALUES (?1)",
+        [&title],
+    );
+    match res {
+        Ok(_) => {
+            let chat_id = conn.last_insert_rowid();
+            set_current_chat_id(chat_id);
+            println!("✅ Started new chat '{}' (id: {})", title, chat_id);
+        },
+        Err(e) => eprintln!("Failed to create chat: {}", e),
+    }
+}
+
+pub fn list_chats() {
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let mut stmt = match conn.prepare("SELECT id, title, created_at FROM chats ORDER BY created_at DESC") {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Query error: {}", e); return; }
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    });
+    match rows {
+        Ok(rows) => {
+            println!("\nChats:");
+            for row in rows.flatten() {
+                println!("  [{}] {} (created: {})", row.0, row.1, row.2);
+            }
+        },
+        Err(e) => eprintln!("Failed to list chats: {}", e),
+    }
+}
+
+pub fn switch_chat(chat_id: i64) {
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let mut stmt = match conn.prepare("SELECT id, title FROM chats WHERE id = ?1") {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Query error: {}", e); return; }
+    };
+    let result = stmt.query_row([chat_id], |row| {
+        Ok(row.get::<_, String>(1)?)
+    });
+    match result {
+        Ok(title) => {
+            set_current_chat_id(chat_id);
+            println!("✅ Switched to chat [{}] {}", chat_id, title);
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            eprintln!("Chat ID {} not found.", chat_id);
+        }
+        Err(e) => eprintln!("Failed to switch chat: {}", e),
+    }
+}
+
+pub fn set_profile(pair: &str) {
+    let parts: Vec<&str> = pair.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        eprintln!("Invalid format. Use key=value");
+        return;
+    }
+    let key = parts[0].trim();
+    let value = parts[1].trim();
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let res = conn.execute(
+        "INSERT INTO user_profile (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [key, value],
+    );
+    match res {
+        Ok(_) => println!("✅ Set profile: {} = {}", key, value),
+        Err(e) => eprintln!("Failed to set profile: {}", e),
+    }
+}
+
+pub fn summarize_chat(chat_id: i64) {
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let mut stmt = match conn.prepare("SELECT role, content FROM messages WHERE chat_id = ?1 ORDER BY created_at ASC") {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Query error: {}", e); return; }
+    };
+    let rows = stmt.query_map([chat_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    });
+    match rows {
+        Ok(rows) => {
+            let mut full_chat = String::new();
+            for row in rows.flatten() {
+                let (role, content) = row;
+                let who = match role.as_str() { "user" => "You", "assistant" => "AI", _ => &role };
+                full_chat.push_str(&format!("{}: {}\n", who, content));
+            }
+            println!("\n--- Chat #{} Summary (stub) ---\n{}\n-------------------------------\n", chat_id, full_chat);
+            // TODO: Send full_chat to AI with a 'summarize' prompt and print the result
+        },
+        Err(e) => eprintln!("Failed to summarize chat: {}", e),
+    }
+}
+
+pub fn search_chats(query: &str) {
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let sql = "SELECT chat_id, created_at, role, content FROM messages WHERE content LIKE ?1 ORDER BY chat_id, created_at";
+    let pattern = format!("%{}%", query);
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Query error: {}", e); return; }
+    };
+    let rows = stmt.query_map([pattern], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+    });
+    match rows {
+        Ok(rows) => {
+            println!("\n--- Search Results for '{}' ---", query);
+            for row in rows.flatten() {
+                let (chat_id, ts, role, content) = row;
+                let who = match role.as_str() { "user" => "You", "assistant" => "AI", _ => &role };
+                println!("[chat {}] [{}] {}: {}", chat_id, ts, who, content);
+            }
+            println!("-------------------------------\n");
+        },
+        Err(e) => eprintln!("Failed to search chats: {}", e),
+    }
+}
+
+pub fn view_chat() {
+    let chat_id = match get_current_chat_id() {
+        Some(id) => id,
+        None => { eprintln!("No current chat selected. Start or switch to a chat first."); return; }
+    };
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("DB error: {}", e); return; }
+    };
+    let mut stmt = match conn.prepare("SELECT created_at, role, content FROM messages WHERE chat_id = ?1 ORDER BY created_at ASC") {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Query error: {}", e); return; }
+    };
+    let rows = stmt.query_map([chat_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    });
+    match rows {
+        Ok(rows) => {
+            println!("\n--- Chat History (chat id: {}) ---", chat_id);
+            for row in rows.flatten() {
+                let (ts, role, content) = row;
+                let who = match role.as_str() { "user" => "You", "assistant" => "AI", _ => &role };
+                println!("[{}] {}: {}", ts, who, content);
+            }
+            println!("-------------------------------\n");
+        },
+        Err(e) => eprintln!("Failed to view chat: {}", e),
+    }
+}
+
+pub fn delete_chat(chat_id: i64) {
+    println!("Are you sure you want to delete chat {}? This cannot be undone! (y/N): ", chat_id);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    if input.trim().to_lowercase() == "y" {
+        let conn = match init_db() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("DB error: {}", e); return; }
+        };
+        if let Err(e) = conn.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id]) {
+            eprintln!("Failed to delete chat messages: {}", e);
+        }
+        if let Err(e) = conn.execute("DELETE FROM chats WHERE id = ?1", [chat_id]) {
+            eprintln!("Failed to delete chat: {}", e);
+        }
+        println!("✅ Deleted chat {}", chat_id);
+    } else {
+        println!("Aborted.");
+    }
+}
+
+pub fn clear_all_chats() {
+    println!("Are you sure you want to delete ALL chats and messages? This cannot be undone! (y/N): ");
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    if input.trim().to_lowercase() == "y" {
+        let conn = match init_db() {
+            Ok(c) => c,
+            Err(e) => { eprintln!("DB error: {}", e); return; }
+        };
+        if let Err(e) = conn.execute("DELETE FROM messages", []) {
+            eprintln!("Failed to clear messages: {}", e);
+        }
+        if let Err(e) = conn.execute("DELETE FROM chats", []) {
+            eprintln!("Failed to clear chats: {}", e);
+        }
+        println!("✅ All chats and messages deleted");
+    } else {
+        println!("Aborted.");
+    }
 }
 

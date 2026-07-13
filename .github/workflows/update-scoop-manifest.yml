@@ -1,0 +1,44 @@
+name: update-scoop-manifest
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - '*'
+
+jobs:
+  update-scoop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout scoop-bucket
+        uses: actions/checkout@v4
+        with:
+          repository: lershi-devlabs/scoop-bucket
+          token: ${{ secrets.YO_TOKEN }}
+          path: scoop-bucket
+
+      - name: Update yo.json manifest
+        run: |
+          VERSION=${{ github.event.release.tag_name || github.ref_name }}
+          cd scoop-bucket
+          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" yo.json
+          sed -i "s|\"url\": \"https://github.com/.*/yo-.*-x86_64-pc-windows-msvc.zip\"|\"url\": \"https://github.com/lershi-devlabs/yo/releases/download/$VERSION/yo-$VERSION-x86_64-pc-windows-msvc.zip\"|" yo.json
+      - name: Update sha256 in yo.json
+        run: |
+          VERSION=${{ github.event.release.tag_name || github.ref_name }}
+          cd scoop-bucket
+          curl -LO "https://github.com/lershi-devlabs/yo/releases/download/$VERSION/yo-$VERSION-x86_64-pc-windows-msvc.zip"
+          SHA=$(sha256sum yo-$VERSION-x86_64-pc-windows-msvc.zip | awk '{print $1}')
+          sed -i "s|\"sha256\": \"[a-f0-9]\{64\}\"|\"sha256\": \"$SHA\"|" yo.json
+      - name: Commit and push yo.json
+        env:
+          SCOOP_PUSH_TOKEN: ${{ secrets.SCOOP_PUSH_TOKEN }}
+        run: |
+          cd scoop-bucket
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add yo.json
+          git commit -m "Update yo to $VERSION"
+          git remote set-url origin https://$SCOOP_PUSH_TOKEN@github.com/lershi-devlabs/scoop-bucket.git
+          git push origin main 

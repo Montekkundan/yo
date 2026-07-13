@@ -2,7 +2,7 @@ name: cargo-publish
 
 on:
   workflow_run:
-    workflows: ["release", "update-homebrew-formula"]
+    workflows: ["release"]
     types:
       - completed
 

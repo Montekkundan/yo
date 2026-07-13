@@ -1,0 +1,46 @@
+name: update-aur-pkgbuild
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - '*'
+
+jobs:
+  update-aur:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout AUR repo
+        uses: actions/checkout@v4
+        with:
+          repository: lershi-devlabs/yo-bin-aur
+          token: ${{ secrets.YO_TOKEN }}
+          path: aur
+
+      - name: Update PKGBUILD
+        run: |
+          VERSION=${{ github.event.release.tag_name || github.ref_name }}
+          cd aur
+          sed -i "s/pkgver=.*/pkgver=$VERSION/" PKGBUILD
+          sed -i "s|source=(\"https://github.com/.*/yo-.*-x86_64-unknown-linux-musl.tar.gz\")|source=(\"https://github.com/lershi-devlabs/yo/releases/download/$VERSION/yo-$VERSION-x86_64-unknown-linux-musl.tar.gz\")|" PKGBUILD
+
+      - name: Update sha256sums in PKGBUILD
+        run: |
+          VERSION=${{ github.event.release.tag_name || github.ref_name }}
+          cd aur
+          curl -LO "https://github.com/lershi-devlabs/yo/releases/download/$VERSION/yo-$VERSION-x86_64-unknown-linux-musl.tar.gz"
+          SHA=$(sha256sum yo-$VERSION-x86_64-unknown-linux-musl.tar.gz | awk '{print $1}')
+          sed -i "s|sha256sums=('.*')|sha256sums=('$SHA')|" PKGBUILD
+
+      - name: Commit and push PKGBUILD
+        env:
+          AUR_PUSH_TOKEN: ${{ secrets.AUR_PUSH_TOKEN }}
+        run: |
+          cd aur
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add PKGBUILD
+          git commit -m "Update PKGBUILD for $VERSION"
+          git remote set-url origin https://$AUR_PUSH_TOKEN@github.com/lershi-devlabs/yo-bin-aur.git
+          git push origin main 

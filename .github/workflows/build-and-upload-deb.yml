@@ -1,0 +1,26 @@
+name: build-and-upload-deb
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust and cargo-deb
+        run: |
+          rustup update stable
+          rustup default stable
+          cargo install cargo-deb
+
+      - name: Build .deb
+        run: cargo deb
+
+      - name: Upload .deb to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/debian/yo_*_amd64.deb 

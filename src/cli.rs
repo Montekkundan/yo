@@ -48,5 +48,50 @@ pub enum Command {
     
     #[command(external_subcommand)]
     Other(Vec<String>),
+    
+    #[command(about = "Start a new chat session", long_about = "Begin a new chat session and set it as the current chat.")]
+    NewChat {
+        #[arg(help = "Optional title for the new chat")]
+        title: Option<String>,
+    },
+
+    #[command(about = "List all chat sessions", long_about = "List all chat sessions with their IDs and titles.")]
+    ListChats,
+
+    #[command(about = "Switch to a chat session", long_about = "Switch to a specific chat session by its ID.")]
+    SwitchChat {
+        #[arg(help = "ID of the chat to switch to")]
+        chat_id: i64,
+    },
+
+    #[command(about = "Set a user profile key-value pair", long_about = "Set a key-value pair in the user profile (global memory). Format: key=value")]
+    SetProfile {
+        #[arg(help = "Key-value pair, e.g. name=Montek")]
+        pair: String,
+    },
+
+    #[command(about = "Summarize a chat session", long_about = "Summarize the messages in a chat session by its ID.")]
+    SummarizeChat {
+        #[arg(help = "ID of the chat to summarize")]
+        chat_id: i64,
+    },
+
+    #[command(about = "Search all chats for a keyword", long_about = "Search all chat messages for a given keyword.")]
+    Search {
+        #[arg(help = "Keyword to search for")]
+        query: String,
+    },
+
+    #[command(about = "View the current chat's history", long_about = "Display all messages in the current chat session in a readable format.")]
+    ViewChat,
+
+    #[command(about = "Delete a chat session", long_about = "Delete a specific chat session and all its messages by its ID.")]
+    DeleteChat {
+        #[arg(help = "ID of the chat to delete")]
+        chat_id: i64,
+    },
+
+    #[command(about = "Delete all chats and messages", long_about = "Delete all chat sessions and all messages. This cannot be undone.")]
+    ClearAllChats,
 }
 
