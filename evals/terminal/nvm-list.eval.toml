@@ -1,0 +1,12 @@
+description = "Uses the command tool to list installed nvm Node.js versions and the active version."
+prompt = "Show all Node.js versions installed through nvm and identify which one is active. Inspect my terminal instead of only explaining the command."
+tags = ["terminal", "tools", "node"]
+requires = ["nvm"]
+allowed_commands = ["nvm list", "nvm ls"]
+
+[expect]
+tool = "run_command"
+commands = ["nvm list", "nvm ls"]
+exit_code = 0
+stdout_nonempty = true
+reply_nonempty = true

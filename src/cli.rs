@@ -1,97 +1,247 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
-#[derive(Parser)]
-#[command(name = "yo", about = "ask your terminal anything", version)]
+#[derive(Parser, Debug)]
+#[command(name = "yo", about = "your personal AI terminal assistant", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
-    #[command(about = "Ask your AI a question", 
-        long_about = "Ask the currently configured AI model a question. The response will stream in real-time if using OpenAI.\n\nYou can use this command as either:\n  yo ask <question>\n  yo <question>\n\nBoth forms are equivalent.", 
-        visible_alias = "a")]
+    #[command(visible_alias = "a", about = "Ask Yo a question")]
     Ask {
-        #[arg(required = true, help = "The question or prompt to send to the AI")]
+        #[arg(long, help = "Do not store or recall durable memory for this turn")]
+        private: bool,
+        #[arg(required = true)]
         question: Vec<String>,
     },
-    
-    #[command(about = "Setup your AI configuration", long_about = "Interactive setup to configure your AI backend (Ollama or OpenAI) and select a default model.")]
+
+    #[command(about = "Configure a Vercel AI Gateway credential and model")]
     Setup,
-    
-    #[command(about = "Show config file path", long_about = "Print the path to the configuration file where your settings are stored.")]
+
+    #[command(subcommand, about = "Manage the Vercel AI Gateway credential")]
+    Gateway(GatewayCommand),
+
+    #[command(about = "Show Yo's local configuration paths")]
     Config,
-    
-    #[command(about = "Switch AI backend", long_about = "Switch between Ollama and OpenAI backends, or select a different model for your current backend.")]
-    Switch {
-        /// either "openai" or "ollama"
-        #[arg(help = "Backend to switch to: 'openai' or 'ollama'")]
-        model: String,
-    },
-    
-    #[command(about = "Set specific GPT model", long_about = "Directly set a specific OpenAI model without going through the selection menu.")]
-    Gpt {
-        /// specific GPT model to use, e.g. "gpt-3.5-turbo" or "gpt-4"
-        #[arg(help = "OpenAI model name to use (e.g. 'gpt-4', 'gpt-3.5-turbo')")]
-        model: String,
-    },
-    
-    #[command(about = "List available AI models", long_about = "Show a list of all available models from both Ollama and OpenAI backends.")]
-    List,
-    
-    #[command(about = "Show current AI model in use", long_about = "Display information about the currently selected AI backend and model.")]
+
+    #[command(
+        visible_alias = "list",
+        about = "List models available through AI Gateway"
+    )]
+    Models,
+
+    #[command(about = "Select a Vercel AI Gateway model")]
+    Model { model: String },
+
+    #[command(about = "Show the active model, session, and feature status")]
     Current,
-    
-    #[command(about = "Clear the conversation history", long_about = "Clear the conversation history stored in history.txt.")]
-    ClearHistory,
-    
-    #[command(external_subcommand)]
-    Other(Vec<String>),
-    
-    #[command(about = "Start a new chat session", long_about = "Begin a new chat session and set it as the current chat.")]
-    NewChat {
-        #[arg(help = "Optional title for the new chat")]
+
+    #[command(about = "Show or change model command approval behavior")]
+    Permissions {
+        #[arg(value_enum)]
+        mode: Option<PermissionMode>,
+        #[arg(long, help = "Confirm the full-access warning non-interactively")]
+        yes: bool,
+    },
+
+    #[command(
+        about = "Run a command, capture its result, and save it as terminal context",
+        trailing_var_arg = true
+    )]
+    Run {
+        #[arg(required = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    #[command(about = "Print shell integration for a new terminal session")]
+    Init { shell: ShellKind },
+
+    #[command(
+        visible_alias = "new-chat",
+        about = "Start a new chat in this terminal"
+    )]
+    New {
+        #[arg(short, long)]
         title: Option<String>,
     },
 
-    #[command(about = "List all chat sessions", long_about = "List all chat sessions with their IDs and titles.")]
-    ListChats,
+    #[command(visible_alias = "list-chats", about = "List saved chats")]
+    Chats,
 
-    #[command(about = "Switch to a chat session", long_about = "Switch to a specific chat session by its ID.")]
-    SwitchChat {
-        #[arg(help = "ID of the chat to switch to")]
-        chat_id: i64,
-    },
+    #[command(
+        visible_alias = "switch-chat",
+        about = "Use a saved chat in this terminal"
+    )]
+    Chat { chat_id: i64 },
 
-    #[command(about = "Set a user profile key-value pair", long_about = "Set a key-value pair in the user profile (global memory). Format: key=value")]
-    SetProfile {
-        #[arg(help = "Key-value pair, e.g. name=Montek")]
-        pair: String,
-    },
-
-    #[command(about = "Summarize a chat session", long_about = "Summarize the messages in a chat session by its ID.")]
-    SummarizeChat {
-        #[arg(help = "ID of the chat to summarize")]
-        chat_id: i64,
-    },
-
-    #[command(about = "Search all chats for a keyword", long_about = "Search all chat messages for a given keyword.")]
-    Search {
-        #[arg(help = "Keyword to search for")]
-        query: String,
-    },
-
-    #[command(about = "View the current chat's history", long_about = "Display all messages in the current chat session in a readable format.")]
+    #[command(about = "View the current terminal chat")]
     ViewChat,
 
-    #[command(about = "Delete a chat session", long_about = "Delete a specific chat session and all its messages by its ID.")]
-    DeleteChat {
-        #[arg(help = "ID of the chat to delete")]
-        chat_id: i64,
+    #[command(about = "Delete one chat and its messages")]
+    DeleteChat { chat_id: i64 },
+
+    #[command(about = "Clear the current chat history")]
+    ClearHistory,
+
+    #[command(about = "Delete all local chats")]
+    ClearAllChats,
+
+    #[command(about = "Search chat messages")]
+    Search { query: Vec<String> },
+
+    #[command(about = "Store a durable memory explicitly")]
+    Remember { text: Vec<String> },
+
+    #[command(subcommand, about = "Inspect and manage cross-session memory")]
+    Memory(MemoryCommand),
+
+    #[command(subcommand, about = "Manage personalize.md response instructions")]
+    Personalize(PersonalizeCommand),
+
+    #[command(about = "Open the native terminal settings interface")]
+    Settings,
+
+    #[command(about = "Run file-based agent workflow evals")]
+    Eval {
+        #[arg(value_name = "FILTER", help = "Eval id or directory prefix to run")]
+        filters: Vec<String>,
+        #[arg(long, help = "List discovered evals without running them")]
+        list: bool,
+        #[arg(long, help = "Print a machine-readable JSON summary")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Include replies and command output in the console report"
+        )]
+        verbose: bool,
+        #[arg(long, default_value = "evals", value_name = "PATH")]
+        dir: PathBuf,
     },
 
-    #[command(about = "Delete all chats and messages", long_about = "Delete all chat sessions and all messages. This cannot be undone.")]
-    ClearAllChats,
+    #[command(external_subcommand)]
+    Other(Vec<String>),
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ShellKind {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// Auto-run only an exact, recognized read-only command; ask for everything else.
+    Safe,
+    /// Ask before every command proposed by the model.
+    AlwaysAsk,
+    /// Let the model run commands without approval prompts.
+    FullAccess,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MemoryCommand {
+    List,
+    Search { query: Vec<String> },
+    Edit { id: i64, text: Vec<String> },
+    Forget { id: i64 },
+    Clear,
+    Purge,
+    Export,
+    Reindex,
+    On,
+    Off,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PersonalizeCommand {
+    Show,
+    Path,
+    Edit,
+    Add { instruction: Vec<String> },
+    Reset,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GatewayCommand {
+    Status,
+    Set,
+    Delete,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_question_is_an_external_subcommand() {
+        let cli = Cli::try_parse_from(["yo", "what", "is", "nvm"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Other(_))));
+    }
+
+    #[test]
+    fn run_accepts_flags_after_separator() {
+        let cli = Cli::try_parse_from(["yo", "run", "--", "cargo", "test", "--all"]).unwrap();
+        match cli.command {
+            Some(Command::Run { command }) => {
+                assert_eq!(command, ["cargo", "test", "--all"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_search_parses_multiple_words() {
+        let cli = Cli::try_parse_from(["yo", "memory", "search", "nvim", "command"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Memory(MemoryCommand::Search { .. }))
+        ));
+    }
+
+    #[test]
+    fn gateway_credential_management_parses() {
+        let cli = Cli::try_parse_from(["yo", "gateway", "delete"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Gateway(GatewayCommand::Delete))
+        ));
+    }
+
+    #[test]
+    fn command_permission_modes_parse() {
+        let cli = Cli::try_parse_from(["yo", "permissions", "full-access", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Permissions {
+                mode: Some(PermissionMode::FullAccess),
+                yes: true
+            })
+        ));
+    }
+
+    #[test]
+    fn eval_options_parse() {
+        let cli =
+            Cli::try_parse_from(["yo", "eval", "terminal", "--json", "--dir", "checks"]).unwrap();
+        match cli.command {
+            Some(Command::Eval {
+                filters,
+                list,
+                json,
+                verbose,
+                dir,
+            }) => {
+                assert_eq!(filters, ["terminal"]);
+                assert!(!list);
+                assert!(json);
+                assert!(!verbose);
+                assert_eq!(dir, PathBuf::from("checks"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+}

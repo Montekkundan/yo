@@ -1,197 +1,191 @@
-use std::{env, fs, path::PathBuf};
-use std::process::Command as ProcessCommand;
 use clap::Parser;
-use dotenv::{dotenv, from_filename};
-use yo::cli::{Cli, Command as CliCommand};
-use yo::commands;
 use serial_test::serial;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use uuid::Uuid;
+use yo::cli::{Cli, Command, MemoryCommand, PermissionMode, PersonalizeCommand};
+use yo::config::CommandConfirmation;
+use yo::memory::{MemoryQuery, NewMemory};
 
-// Load environment variables for testing
-fn load_test_env() {
-    let _ = from_filename(".env.test");
-    let _ = dotenv();
-}
-
-// Manage a temporary config directory for isolated tests
 struct TestEnv {
     original: Option<String>,
-    temp_dir: PathBuf,
+    root: PathBuf,
 }
 
 impl TestEnv {
     fn new() -> Self {
-        load_test_env();
         let original = env::var("XDG_CONFIG_HOME").ok();
-        let temp_dir = env::temp_dir().join("yo_test_config");
-        let yo_dir = temp_dir.join("yo");
-        fs::create_dir_all(&yo_dir).unwrap();
-        unsafe { env::set_var("XDG_CONFIG_HOME", &temp_dir); }
-
-        // Write default config
-        let config_path = yo_dir.join("config.toml");
-        let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-        let content = format!(
-            "source = \"openai\"\nmodel = \"gpt-3.5-turbo\"\nopenai_api_key = \"{}\"",
-            api_key
-        );
-        fs::write(&config_path, content).unwrap();
-        TestEnv { original, temp_dir }
+        let root = env::temp_dir().join(format!("yo-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        unsafe { env::set_var("XDG_CONFIG_HOME", &root) };
+        Self { original, root }
     }
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        if let Some(val) = &self.original {
-            unsafe { env::set_var("XDG_CONFIG_HOME", val); }
+        if let Some(value) = &self.original {
+            unsafe { env::set_var("XDG_CONFIG_HOME", value) };
         } else {
-            unsafe { env::remove_var("XDG_CONFIG_HOME"); }
+            unsafe { env::remove_var("XDG_CONFIG_HOME") };
         }
-        let _ = fs::remove_dir_all(&self.temp_dir);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
-// Ollama helpers
-fn is_ollama_available() -> bool {
-    ProcessCommand::new("which").arg("ollama").output().map_or(false, |o| o.status.success())
-}
-
-fn is_ollama_model_available(model: &str) -> bool {
-    if !is_ollama_available() {
-        return false;
-    }
-    ProcessCommand::new("ollama").arg("list").output()
-        .map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains(model))
-}
-
-// Decide if external tests should run
-fn should_run_external_api_tests() -> bool {
-    load_test_env();
-    env::var("ENABLE_EXTERNAL_API_TESTS").map_or(false, |v| v == "true")
-}
-
-// --- CLI parsing tests ---
 #[test]
-fn test_ask_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "ask", "Hello"]).unwrap();
+fn parses_gateway_only_commands() {
+    assert!(matches!(
+        Cli::try_parse_from(["yo", "setup"]).unwrap().command,
+        Some(Command::Setup)
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["yo", "models"]).unwrap().command,
+        Some(Command::Models)
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["yo", "model", "anthropic/claude-sonnet-4.6"])
+            .unwrap()
+            .command,
+        Some(Command::Model { .. })
+    ));
+}
+
+#[test]
+fn parses_private_ask() {
+    let cli = Cli::try_parse_from(["yo", "ask", "--private", "hello"]).unwrap();
     match cli.command {
-        Some(CliCommand::Ask { question }) => assert_eq!(question, vec!["Hello"]),
-        _ => panic!("Expected Ask"),
+        Some(Command::Ask { question, private }) => {
+            assert!(private);
+            assert_eq!(question, ["hello"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
     }
 }
 
 #[test]
-fn test_setup_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "setup"]).unwrap();
-    assert!(matches!(cli.command, Some(CliCommand::Setup)));
-}
-
-#[test]
-fn test_config_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "config"]).unwrap();
-    assert!(matches!(cli.command, Some(CliCommand::Config)));
-}
-
-#[test]
-fn test_switch_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "switch", "openai"]).unwrap();
+fn parses_direct_question() {
+    let cli = Cli::try_parse_from(["yo", "what", "is", "the", "nvim", "command"]).unwrap();
     match cli.command {
-        Some(CliCommand::Switch { model }) => assert_eq!(model, "openai"),
-        _ => panic!("Expected Switch openai"),
+        Some(Command::Other(words)) => assert_eq!(words[0], "what"),
+        other => panic!("unexpected command: {other:?}"),
     }
 }
 
 #[test]
-fn test_gpt_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "gpt", "gpt-4"]).unwrap();
+fn parses_explicit_command_execution() {
+    let cli = Cli::try_parse_from(["yo", "run", "--", "nvm", "list"]).unwrap();
     match cli.command {
-        Some(CliCommand::Gpt { model }) => assert_eq!(model, "gpt-4"),
-        _ => panic!("Expected Gpt gpt-4"),
+        Some(Command::Run { command }) => assert_eq!(command, ["nvm", "list"]),
+        other => panic!("unexpected command: {other:?}"),
     }
 }
 
 #[test]
-fn test_list_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "list"]).unwrap();
-    assert!(matches!(cli.command, Some(CliCommand::List)));
+fn parses_memory_and_personalization_management() {
+    let memory = Cli::try_parse_from(["yo", "memory", "search", "nvim"])
+        .unwrap()
+        .command;
+    assert!(matches!(
+        memory,
+        Some(Command::Memory(MemoryCommand::Search { .. }))
+    ));
+
+    let personalize = Cli::try_parse_from(["yo", "personalize", "add", "be", "casual"])
+        .unwrap()
+        .command;
+    assert!(matches!(
+        personalize,
+        Some(Command::Personalize(PersonalizeCommand::Add { .. }))
+    ));
 }
 
 #[test]
-fn test_current_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "current"]).unwrap();
-    assert!(matches!(cli.command, Some(CliCommand::Current)));
-}
-
-#[test]
-fn test_other_parsing() {
-    let cli = Cli::try_parse_from(&["yo", "foo", "bar"]).unwrap();
-    match cli.command {
-        Some(CliCommand::Other(args)) => assert_eq!(args, vec!["foo", "bar"]),
-        _ => panic!("Expected Other"),
+fn parses_all_command_permission_modes() {
+    for (name, expected) in [
+        ("safe", PermissionMode::Safe),
+        ("always-ask", PermissionMode::AlwaysAsk),
+        ("full-access", PermissionMode::FullAccess),
+    ] {
+        let command = Cli::try_parse_from(["yo", "permissions", name])
+            .unwrap()
+            .command;
+        assert!(matches!(
+            command,
+            Some(Command::Permissions {
+                mode: Some(mode),
+                ..
+            }) if mode == expected
+        ));
     }
 }
 
-// --- Command functionality tests ---
 #[test]
-fn test_show_config_path() {
-    let _env = TestEnv::new();
-    commands::show_config_path();
-}
-
-#[test]
-fn test_show_current() {
-    let _env = TestEnv::new();
-    commands::show_current();
-}
-
-#[test]
-fn test_ollama_avail() {
-    if !is_ollama_available() {
-        eprintln!("Ollama is not installed or not available in PATH, skipping test_ollama_avail");
-        return;
-    }
-    assert!(is_ollama_available(), "Ollama is not installed or not available in PATH");
-}
-
-#[tokio::test]
 #[serial]
-async fn test_set_gpt() {
-    if !should_run_external_api_tests() { return; }
+fn config_never_serializes_provider_secrets() {
     let _env = TestEnv::new();
-    // Debug: print config path and contents
-    let config_path = std::env::temp_dir().join("yo_test_config/yo/config.toml");
-    if let Ok(contents) = std::fs::read_to_string(&config_path) {
-        println!("Config contents before set_gpt:\n{}", contents);
+    let config = yo::config::Config {
+        model: "anthropic/claude-sonnet-4.6".into(),
+        ..yo::config::Config::default()
+    };
+    yo::config::save_config_result(&config).unwrap();
+    let encoded = fs::read_to_string(yo::config::get_config_path()).unwrap();
+    assert!(!encoded.to_lowercase().contains("api_key"));
+    assert!(!encoded.to_lowercase().contains("ollama"));
+    assert!(encoded.contains("anthropic/claude-sonnet-4.6"));
+}
+
+#[test]
+#[serial]
+fn database_and_personalize_file_share_the_private_app_directory() {
+    let _env = TestEnv::new();
+    let _conn = yo::db::init_db().unwrap();
+    let personalize = yo::personalize::ensure_exists().unwrap();
+    assert_eq!(yo::db::get_db_path().parent(), personalize.parent());
+    assert!(yo::db::get_db_path().exists());
+    assert!(personalize.exists());
+}
+
+#[test]
+#[serial]
+fn memory_survives_database_reopen_and_a_new_terminal_session() {
+    let _env = TestEnv::new();
+    {
+        let conn = yo::db::init_db().unwrap();
+        yo::memory::init_memory_schema(&conn).unwrap();
+        yo::db::ensure_session(&conn, "terminal-one", "zsh", None, "/tmp", None).unwrap();
+        yo::memory::add_memory(
+            &conn,
+            &NewMemory::global("cross-session retention token cobalt719"),
+        )
+        .unwrap();
     }
-    commands::set_gpt("gpt-3.5-turbo").await;
+
+    let conn = yo::db::init_db().unwrap();
+    yo::memory::init_memory_schema(&conn).unwrap();
+    yo::db::ensure_session(&conn, "terminal-two", "zsh", None, "/tmp", None).unwrap();
+    let found = yo::memory::search_memories(&conn, &MemoryQuery::text("cobalt719")).unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found[0].memory.text.contains("cobalt719"));
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn test_ask_openai() {
-    if !should_run_external_api_tests() { return; }
+fn full_access_permission_persists_without_serializing_secrets() {
     let _env = TestEnv::new();
-    let config_path = std::env::temp_dir().join("yo_test_config/yo/config.toml");
-    if let Ok(contents) = std::fs::read_to_string(&config_path) {
-        println!("Config contents before ask_openai:\n{}", contents);
-    }
-    commands::ask(&["Ping".into()]).await;
-}
+    let config = yo::config::Config {
+        command_confirmation: CommandConfirmation::FullAccess,
+        ..yo::config::Config::default()
+    };
+    yo::config::save_config_result(&config).unwrap();
 
-#[tokio::test]
-#[serial]
-async fn test_ask_ollama() {
-    if !should_run_external_api_tests() { return; }
-    let model = env::var("OLLAMA_TEST_MODEL").unwrap_or_else(|_| "llama3".into());
-    if !is_ollama_model_available(&model) { return; }
-    let _env = TestEnv::new();
-    commands::switch("ollama").await;
-    commands::ask(&["Ping".into()]).await;
-}
-
-#[tokio::test]
-#[serial]
-async fn test_switch_cmd() {
-    if !should_run_external_api_tests() { return; }
-    let _env = TestEnv::new();
-    commands::switch("openai").await;
+    let reloaded = yo::config::load_config().unwrap();
+    assert_eq!(
+        reloaded.command_confirmation,
+        CommandConfirmation::FullAccess
+    );
+    let encoded = fs::read_to_string(yo::config::get_config_path()).unwrap();
+    assert!(encoded.contains("command_confirmation = \"full-access\""));
+    assert!(!encoded.to_lowercase().contains("api_key"));
 }

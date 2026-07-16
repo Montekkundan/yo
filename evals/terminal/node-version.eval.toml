@@ -1,0 +1,13 @@
+description = "Uses the command tool to inspect the active Node.js version."
+prompt = "Check which Node.js version is active in my terminal and report the real result."
+tags = ["terminal", "tools", "node"]
+requires = ["node"]
+allowed_commands = ["node --version", "node -v"]
+
+[expect]
+tool = "run_command"
+commands = ["node --version", "node -v"]
+exit_code = 0
+stdout_nonempty = true
+stdout_contains = ["v"]
+reply_nonempty = true

@@ -1,4 +1,11 @@
 pub mod cli;
-pub mod config;
 pub mod commands;
+pub mod config;
 pub mod db;
+pub mod evals;
+pub mod gateway;
+pub mod memory;
+pub mod personalize;
+pub mod render;
+pub mod terminal;
+pub mod tui;
