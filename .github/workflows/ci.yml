@@ -5,8 +5,17 @@ on:
   push:
     branches: [master, main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
+    name: rust (${{ matrix.os }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -19,8 +28,42 @@ jobs:
           components: rustfmt, clippy
       - name: Formatting
         if: runner.os == 'Linux'
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Tests
-        run: cargo test --all
+        run: cargo test --locked --all
+      - name: Package
+        if: runner.os == 'Linux'
+        run: cargo package --locked
+
+  release-build:
+    name: release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            install_musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            install_musl: true
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - name: Install musl-tools
+        if: matrix.install_musl == true
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}

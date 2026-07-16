@@ -1214,10 +1214,7 @@ fn redact_known_token_shapes(token: &str) -> String {
     let mut output = token.to_string();
     for prefix in PREFIXES {
         let mut search_from = 0_usize;
-        loop {
-            let Some(relative_start) = output[search_from..].find(prefix) else {
-                break;
-            };
+        while let Some(relative_start) = output[search_from..].find(prefix) {
             let start = search_from + relative_start;
             let secret_end = output[start..]
                 .char_indices()
