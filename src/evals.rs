@@ -607,11 +607,7 @@ mod tests {
 
     #[test]
     fn ids_and_prefix_filters_follow_directory_layout() {
-        let root = std::env::temp_dir().join(format!(
-            "yo-eval-discovery-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root = std::env::temp_dir().join(format!("yo-eval-discovery-{}", uuid::Uuid::new_v4()));
         let nested = root.join("terminal");
         fs::create_dir_all(&nested).unwrap();
         fs::write(
