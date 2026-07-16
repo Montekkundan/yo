@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  create-release:
-    name: create-release
+  prepare-release:
+    name: prepare-release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.set_version.outputs.version }}
@@ -19,8 +19,9 @@ jobs:
       - name: Get the release version from the tag
         id: set_version
         run: |
-          echo "::set-output name=version::${GITHUB_REF#refs/tags/}"
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          version="${GITHUB_REF#refs/tags/}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Show the version
         run: |
           echo "version is: $VERSION"
@@ -31,15 +32,9 @@ jobs:
             echo "version does not match Cargo.toml" >&2
             exit 1
           fi
-      - name: Create GitHub release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create $VERSION --verify-tag --title $VERSION
-
   build-release:
     name: build-release
-    needs: ['create-release']
+    needs: ['prepare-release']
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -53,6 +48,10 @@ jobs:
           os: macos-latest
           rust: stable
           target: x86_64-apple-darwin
+        - build: windows
+          os: windows-latest
+          rust: stable
+          target: x86_64-pc-windows-msvc
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -81,18 +80,35 @@ jobs:
         cargo build --release --target ${{ matrix.target }}
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
           bin="target/${{ matrix.target }}/release/yo.exe"
-          archive="yo-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip"
+          archive="yo-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.zip"
           7z a "$archive" "$bin"
         else
           bin="target/${{ matrix.target }}/release/yo"
-          archive="yo-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz"
+          archive="yo-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.tar.gz"
           tar czf "$archive" -C "$(dirname $bin)" "$(basename $bin)"
         fi
         echo "ARCHIVE=$archive" >> $GITHUB_ENV
-    - name: Upload release archive
+    - name: Stage release archive
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.target }}
+        path: ${{ env.ARCHIVE }}
+        if-no-files-found: error
+
+  publish-release:
+    name: publish-release
+    needs: ['prepare-release', 'build-release']
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download verified release archives
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        merge-multiple: true
+    - name: Create GitHub release with all archives
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       shell: bash
       run: |
-        version="${{ needs.create-release.outputs.version }}"
-        gh release upload "$version" "$ARCHIVE"
+        version="${{ needs.prepare-release.outputs.version }}"
+        gh release create "$version" artifacts/* --verify-tag --title "$version"
