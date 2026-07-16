@@ -3,8 +3,7 @@ name: update-homebrew-formula
 on:
   workflow_run:
     workflows: ["release"]
-    types:
-      - completed
+    types: [completed]
 
 permissions:
   contents: write
@@ -13,62 +12,87 @@ jobs:
   update-formula:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: master
 
-      - name: Get release version from tag
-        run: |
-          # Try to get the tag from the workflow_run event
-          TAG="${{ github.event.workflow_run.head_branch }}"
-          # If the tag is empty or not a version, try to get it from the release API
-          if [[ -z "$TAG" || ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            TAG=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r .tag_name)
-          fi
-          echo "VERSION=$TAG" >> $GITHUB_ENV
-
-      - name: Download macOS tarball
-        run: |
-          curl -L -o yo-$VERSION-x86_64-apple-darwin.tar.gz \
-            https://github.com/${{ github.repository }}/releases/download/$VERSION/yo-$VERSION-x86_64-apple-darwin.tar.gz
-
-      - name: Calculate macOS sha256
-        id: macos_sha
-        run: |
-          MAC_SHA=$(shasum -a 256 yo-$VERSION-x86_64-apple-darwin.tar.gz | awk '{print $1}')
-          echo "sha256=$MAC_SHA" >> $GITHUB_OUTPUT
-
-      - name: Download Linux tarball
-        run: |
-          curl -L -o yo-$VERSION-x86_64-unknown-linux-musl.tar.gz \
-            https://github.com/${{ github.repository }}/releases/download/$VERSION/yo-$VERSION-x86_64-unknown-linux-musl.tar.gz
-
-      - name: Calculate Linux sha256
-        id: linux_sha
-        run: |
-          LINUX_SHA=$(shasum -a 256 yo-$VERSION-x86_64-unknown-linux-musl.tar.gz | awk '{print $1}')
-          echo "sha256=$LINUX_SHA" >> $GITHUB_OUTPUT
-
-      - name: Update Homebrew formula
-        run: |
-          FORMULA_PATH="Formula/yo-bin.rb"
-          MAC_SHA=${{ steps.macos_sha.outputs.sha256 }}
-          LINUX_SHA=${{ steps.linux_sha.outputs.sha256 }}
-          sed -i "s/version '.*'/version '$VERSION'/" $FORMULA_PATH
-          sed -i "s|url \"https://github.com/.*/yo-[^/]*-x86_64-apple-darwin.tar.gz\"|url \"https://github.com/${{ github.repository }}/releases/download/$VERSION/yo-$VERSION-x86_64-apple-darwin.tar.gz\"|" $FORMULA_PATH
-          sed -i "s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"$MAC_SHA\"/" $FORMULA_PATH
-          sed -i "s|url \"https://github.com/.*/yo-[^/]*-x86_64-unknown-linux-musl.tar.gz\"|url \"https://github.com/${{ github.repository }}/releases/download/$VERSION/yo-$VERSION-x86_64-unknown-linux-musl.tar.gz\"|" $FORMULA_PATH
-          sed -i "s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"$LINUX_SHA\"/2" $FORMULA_PATH
-
-      - name: Commit and push updated formula
+      - name: Read published version
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "VERSION=$(gh api repos/${GITHUB_REPOSITORY}/releases/latest --jq .tag_name)" >> "$GITHUB_ENV"
+
+      - name: Download release archives
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
+          for target in \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-musl
+          do
+            curl --fail --location --show-error \
+              --output "yo-${VERSION}-${target}.tar.gz" \
+              "${base}/yo-${VERSION}-${target}.tar.gz"
+          done
+
+      - name: Calculate checksums
+        run: |
+          echo "MAC_X64_SHA=$(sha256sum yo-${VERSION}-x86_64-apple-darwin.tar.gz | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+          echo "MAC_ARM_SHA=$(sha256sum yo-${VERSION}-aarch64-apple-darwin.tar.gz | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+          echo "LINUX_X64_SHA=$(sha256sum yo-${VERSION}-x86_64-unknown-linux-musl.tar.gz | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+          echo "LINUX_ARM_SHA=$(sha256sum yo-${VERSION}-aarch64-unknown-linux-musl.tar.gz | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Update and validate formula
+        run: |
+          cat > Formula/yo-bin.rb <<EOF
+          class YoBin < Formula
+            desc "Personal AI terminal assistant powered by Vercel AI Gateway"
+            homepage "https://github.com/Montekkundan/yo"
+            version "${VERSION}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/Montekkundan/yo/releases/download/${VERSION}/yo-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${MAC_ARM_SHA}"
+              else
+                url "https://github.com/Montekkundan/yo/releases/download/${VERSION}/yo-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${MAC_X64_SHA}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/Montekkundan/yo/releases/download/${VERSION}/yo-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${LINUX_ARM_SHA}"
+              else
+                url "https://github.com/Montekkundan/yo/releases/download/${VERSION}/yo-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${LINUX_X64_SHA}"
+              end
+            end
+
+            def install
+              bin.install "yo"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/yo --version")
+            end
+          end
+          EOF
+          ruby -c Formula/yo-bin.rb
+
+      - name: Commit updated formula
+        run: |
+          if git diff --quiet -- Formula/yo-bin.rb; then
+            echo "Formula is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/yo-bin.rb
-          git commit -m "chore(homebrew): update yo-bin.rb for $VERSION"
-          git push
+          git commit -m "chore(homebrew): update yo-bin.rb for ${VERSION}"
+          git push origin master

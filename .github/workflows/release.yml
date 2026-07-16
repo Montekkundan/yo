@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   prepare-release:
     name: prepare-release
@@ -22,9 +26,6 @@ jobs:
           version="${GITHUB_REF#refs/tags/}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "VERSION=$version" >> "$GITHUB_ENV"
-      - name: Show the version
-        run: |
-          echo "version is: $VERSION"
       - name: Check that tag version and Cargo.toml version are the same
         shell: bash
         run: |
@@ -33,51 +34,41 @@ jobs:
             exit 1
           fi
   build-release:
-    name: build-release
+    name: build (${{ matrix.target }})
     needs: ['prepare-release']
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-        - build: linux
-          os: ubuntu-latest
-          rust: stable
+        - os: ubuntu-latest
           target: x86_64-unknown-linux-musl
-        - build: macos
-          os: macos-latest
-          rust: stable
+          install_musl: true
+        - os: ubuntu-24.04-arm
+          target: aarch64-unknown-linux-musl
+          install_musl: true
+        - os: macos-15-intel
           target: x86_64-apple-darwin
-        - build: windows
-          os: windows-latest
-          rust: stable
+        - os: macos-latest
+          target: aarch64-apple-darwin
+        - os: windows-latest
           target: x86_64-pc-windows-msvc
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: ${{ matrix.rust }}
         target: ${{ matrix.target }}
-    - name: Install musl-tools (Linux musl only)
-      if: matrix.target == 'x86_64-unknown-linux-musl'
+    - name: Install musl-tools
+      if: matrix.install_musl == true
       run: sudo apt-get update && sudo apt-get install -y musl-tools
-    - name: Set OpenSSL to vendored (macOS only)
-      if: matrix.os == 'macos-latest'
-      run: |
-        echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
-        echo "OPENSSL_VENDORED=1" >> $GITHUB_ENV
-    - name: Set OpenSSL to vendored (Linux musl only)
-      if: matrix.target == 'x86_64-unknown-linux-musl'
-      run: |
-        echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
-        echo "OPENSSL_VENDORED=1" >> $GITHUB_ENV
     - name: Build release binary
       shell: bash
       run: |
-        set -e
-        cargo build --release --target ${{ matrix.target }}
+        set -euo pipefail
+        cargo build --release --locked --target ${{ matrix.target }}
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
           bin="target/${{ matrix.target }}/release/yo.exe"
           archive="yo-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.zip"
@@ -110,5 +101,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       shell: bash
       run: |
+        set -euo pipefail
         version="${{ needs.prepare-release.outputs.version }}"
+        (cd artifacts && sha256sum yo-* > SHA256SUMS)
         gh release create "$version" artifacts/* --verify-tag --title "$version"

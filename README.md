@@ -1,5 +1,9 @@
 # yo
 
+[![CI](https://github.com/Montekkundan/yo/actions/workflows/ci.yml/badge.svg)](https://github.com/Montekkundan/yo/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/yo.svg)](https://crates.io/crates/yo)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 Yo is a personal AI assistant for your terminal. It uses [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) for every model request and keeps chats, terminal context, personalization, and durable memory on your machine.
 
 ## What it does
@@ -17,7 +21,7 @@ Yo does not contain direct provider integrations or a local-model backend. Chat,
 
 ## Install
 
-Precompiled binaries are available from the [Releases page](https://github.com/montekkundan/yo/releases).
+Precompiled binaries are available from the [Releases page](https://github.com/montekkundan/yo/releases) for Apple Silicon and Intel macOS, ARM64 and x86-64 Linux, and x86-64 Windows.
 
 With Homebrew:
 
@@ -268,6 +272,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 cargo build --release
+cargo package --locked
 ```
 
 ### Test this checkout without using an installed `yo`
@@ -301,4 +306,4 @@ cargo run -- what is this project
 
 ## License
 
-MIT
+[MIT](./LICENSE)

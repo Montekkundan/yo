@@ -1,44 +1,78 @@
 name: update-scoop-manifest
 
 on:
-  release:
-    types: [published]
-  push:
-    tags:
-      - '*'
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+
+permissions:
+  contents: read
 
 jobs:
   update-scoop:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout scoop-bucket
+      - name: Require distribution token
+        env:
+          DISTRIBUTION_TOKEN: ${{ secrets.DISTRIBUTION_TOKEN }}
+        run: |
+          if [ -z "$DISTRIBUTION_TOKEN" ]; then
+            echo "::error::Add a DISTRIBUTION_TOKEN repository secret with write access to Montekkundan/scoop-bucket."
+            exit 1
+          fi
+
+      - name: Read published version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "VERSION=$(gh api repos/${GITHUB_REPOSITORY}/releases/latest --jq .tag_name)" >> "$GITHUB_ENV"
+
+      - name: Checkout Scoop bucket
         uses: actions/checkout@v4
         with:
-          repository: lershi-devlabs/scoop-bucket
-          token: ${{ secrets.YO_TOKEN }}
+          repository: Montekkundan/scoop-bucket
+          token: ${{ secrets.DISTRIBUTION_TOKEN }}
           path: scoop-bucket
 
-      - name: Update yo.json manifest
+      - name: Download archive and calculate checksum
         run: |
-          VERSION=${{ github.event.release.tag_name || github.ref_name }}
-          cd scoop-bucket
-          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" yo.json
-          sed -i "s|\"url\": \"https://github.com/.*/yo-.*-x86_64-pc-windows-msvc.zip\"|\"url\": \"https://github.com/lershi-devlabs/yo/releases/download/$VERSION/yo-$VERSION-x86_64-pc-windows-msvc.zip\"|" yo.json
-      - name: Update sha256 in yo.json
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/yo-${VERSION}-x86_64-pc-windows-msvc.zip"
+          curl --fail --location --show-error --output yo-windows.zip "$url"
+          echo "WINDOWS_URL=$url" >> "$GITHUB_ENV"
+          echo "WINDOWS_SHA=$(sha256sum yo-windows.zip | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Update and validate manifest
         run: |
-          VERSION=${{ github.event.release.tag_name || github.ref_name }}
-          cd scoop-bucket
-          curl -LO "https://github.com/lershi-devlabs/yo/releases/download/$VERSION/yo-$VERSION-x86_64-pc-windows-msvc.zip"
-          SHA=$(sha256sum yo-$VERSION-x86_64-pc-windows-msvc.zip | awk '{print $1}')
-          sed -i "s|\"sha256\": \"[a-f0-9]\{64\}\"|\"sha256\": \"$SHA\"|" yo.json
-      - name: Commit and push yo.json
-        env:
-          SCOOP_PUSH_TOKEN: ${{ secrets.SCOOP_PUSH_TOKEN }}
+          jq -n \
+            --arg version "$VERSION" \
+            --arg url "$WINDOWS_URL" \
+            --arg hash "$WINDOWS_SHA" \
+            '{
+              version: $version,
+              description: "Personal AI terminal assistant powered by Vercel AI Gateway",
+              homepage: "https://github.com/Montekkundan/yo",
+              license: "MIT",
+              architecture: {
+                "64bit": {
+                  url: $url,
+                  hash: $hash,
+                  bin: "yo.exe"
+                }
+              }
+            }' > scoop-bucket/yo.json
+          jq empty scoop-bucket/yo.json
+
+      - name: Commit updated manifest
+        working-directory: scoop-bucket
         run: |
-          cd scoop-bucket
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          if git diff --quiet -- yo.json; then
+            echo "Manifest is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add yo.json
-          git commit -m "Update yo to $VERSION"
-          git remote set-url origin https://$SCOOP_PUSH_TOKEN@github.com/Montekkundan/scoop-bucket.git
+          git commit -m "Update yo to ${VERSION}"
           git push origin main

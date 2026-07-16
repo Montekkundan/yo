@@ -1,6 +1,6 @@
 [package]
 name = "yo"
-version = "1.3.5"
+version = "2.0.0"
 edition = "2021"
 authors = ["Montek Kundan <montekkundan@gmail.com>"]
 license = "MIT"
@@ -11,34 +11,8 @@ repository = "https://github.com/montekkundan/yo"
 keywords = ["ai", "cli", "terminal", "assistant", "vercel"]
 categories = ["command-line-utilities"]
 exclude = [
-    "target/*",
-    "www/*",
-    "tests/*",
-    "*.lock",
-    "*.yml",
-    "*.rb",
-    "*.glb",
-    "*.svg",
-    "*.html",
-    "*.css",
-    "*.json",
-    "*.png",
-    "*.jpg",
-    "*.jpeg",
-    "*.gif",
-    "*.mp4",
-    "*.mov",
-    "*.avi",
-    "*.zip",
-    "*.tar",
-    "*.gz",
-    "*.7z",
-    "*.exe",
-    "*.dll",
-    "*.so",
-    "*.dylib",
-    "*.bin",
-    "*.crate",
+    ".github/*",
+    ".omx/*",
     "Formula/*"
 ]
 
