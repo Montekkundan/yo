@@ -480,11 +480,11 @@ pub fn purge_database(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
 }
 
-fn set_private_permissions(path: &Path) {
+fn set_private_permissions(_path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o600));
     }
 }
 

@@ -1867,7 +1867,9 @@ fn command_progress_message(action: &str, command: &str, output: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
     use tokio::net::{TcpListener, TcpStream};
 
     #[test]
@@ -2030,6 +2032,7 @@ mod tests {
         assert_eq!(outcome.tool_calls[0].output["stdout"], "assistant-tool-ok");
     }
 
+    #[cfg(unix)]
     async fn spawn_turn_server<const N: usize>(
         responses: [&'static str; N],
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -2049,6 +2052,7 @@ mod tests {
         (format!("http://{address}/v1"), server)
     }
 
+    #[cfg(unix)]
     async fn read_http_request(socket: &mut TcpStream) {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
