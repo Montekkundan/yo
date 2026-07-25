@@ -5,8 +5,7 @@ on:
     tags:
     - "[0-9]+.[0-9]+.[0-9]+"
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -16,10 +15,12 @@ jobs:
   prepare-release:
     name: prepare-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.set_version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Get the release version from the tag
         id: set_version
         run: |
@@ -37,6 +38,8 @@ jobs:
     name: build (${{ matrix.target }})
     needs: ['prepare-release']
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -56,9 +59,9 @@ jobs:
           target: x86_64-pc-windows-msvc
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@ab40b01f54fe82bdf65693ea090a1e4942c136e7 # 1.91.1
       with:
         target: ${{ matrix.target }}
     - name: Install musl-tools
@@ -72,7 +75,8 @@ jobs:
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
           bin="target/${{ matrix.target }}/release/yo.exe"
           archive="yo-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.zip"
-          7z a "$archive" "$bin"
+          cp "$bin" yo.exe
+          7z a "$archive" yo.exe
         else
           bin="target/${{ matrix.target }}/release/yo"
           archive="yo-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.tar.gz"
@@ -80,28 +84,112 @@ jobs:
         fi
         echo "ARCHIVE=$archive" >> $GITHUB_ENV
     - name: Stage release archive
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: ${{ matrix.target }}
         path: ${{ env.ARCHIVE }}
         if-no-files-found: error
 
+  smoke-release:
+    name: smoke (${{ matrix.target }})
+    needs: ['prepare-release', 'build-release']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-latest
+          target: x86_64-unknown-linux-musl
+          extension: tar.gz
+        - os: ubuntu-24.04-arm
+          target: aarch64-unknown-linux-musl
+          extension: tar.gz
+        - os: macos-15-intel
+          target: x86_64-apple-darwin
+          extension: tar.gz
+        - os: macos-latest
+          target: aarch64-apple-darwin
+          extension: tar.gz
+        - os: windows-latest
+          target: x86_64-pc-windows-msvc
+          extension: zip
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+    - name: Download release archive
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        name: ${{ matrix.target }}
+        path: artifacts
+    - name: Install and run staged artifact
+      shell: bash
+      run: >-
+        bash scripts/artifact-smoke.sh
+        "artifacts/yo-${{ needs.prepare-release.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}"
+        "${{ needs.prepare-release.outputs.version }}"
+
   publish-release:
     name: publish-release
-    needs: ['prepare-release', 'build-release']
+    needs: ['prepare-release', 'build-release', 'smoke-release']
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      artifact-metadata: write
+      contents: write
+      id-token: write
+      attestations: write
     steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Download verified release archives
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
       with:
         path: artifacts
         merge-multiple: true
-    - name: Create GitHub release with all archives
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@ab40b01f54fe82bdf65693ea090a1e4942c136e7 # 1.91.1
+    - name: Install SBOM generator
+      run: cargo install cargo-cyclonedx --locked --version 0.5.9
+    - name: Generate CycloneDX SBOM
+      run: >-
+        cargo cyclonedx --format json --spec-version 1.5
+        --override-filename sbom.cdx
+    - name: Stage checksums and SBOM
+      shell: bash
+      run: |
+        set -euo pipefail
+        mv sbom.cdx.json artifacts/sbom.cdx.json
+        (cd artifacts && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
+    - name: Attest build provenance
+      uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+      with:
+        subject-checksums: artifacts/SHA256SUMS
+    - name: Attest software bill of materials
+      uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+      with:
+        subject-checksums: artifacts/SHA256SUMS
+        sbom-path: artifacts/sbom.cdx.json
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+    - name: Sign release archives and checksums
+      shell: bash
+      run: |
+        set -euo pipefail
+        for file in artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS artifacts/sbom.cdx.json; do
+          cosign sign-blob --yes --bundle "${file}.sigstore.json" "$file"
+          cosign verify-blob "$file" \
+            --bundle "${file}.sigstore.json" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+        done
+    - name: Create GitHub release with verified assets
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       shell: bash
       run: |
         set -euo pipefail
         version="${{ needs.prepare-release.outputs.version }}"
-        (cd artifacts && sha256sum yo-* > SHA256SUMS)
         gh release create "$version" artifacts/* --verify-tag --title "$version"

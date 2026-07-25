@@ -47,12 +47,21 @@ if command -v fish >/dev/null 2>&1; then
 fi
 
 if [[ "${YO_LIVE_TEST:-0}" == "1" ]]; then
-    if [[ -z "${AI_GATEWAY_API_KEY:-}" && -z "${VERCEL_OIDC_TOKEN:-}" ]]; then
-        echo "YO_LIVE_TEST=1 requires AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN" >&2
-        exit 1
+    test_provider="${YO_TEST_PROVIDER:-}"
+    if [[ -z "$test_provider" ]]; then
+        if [[ -n "${AI_GATEWAY_API_KEY:-}" || -n "${VERCEL_OIDC_TOKEN:-}" ]]; then
+            test_provider="vercel"
+        elif [[ -n "${LLM_GATEWAY_API_KEY:-}" || -n "${LLMGATEWAY_API_KEY:-}" ]]; then
+            test_provider="llm-gateway"
+        elif [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+            test_provider="open-router"
+        else
+            echo "YO_LIVE_TEST=1 requires a supported gateway credential" >&2
+            exit 1
+        fi
     fi
-    echo "==> Live isolated Gateway setup"
-    "$yo_bin" setup
+    echo "==> Live isolated Gateway setup ($test_provider)"
+    "$yo_bin" setup --provider "$test_provider"
     "$yo_bin" current
     "$yo_bin" ask --private "Reply with exactly: yo-live-ok"
 

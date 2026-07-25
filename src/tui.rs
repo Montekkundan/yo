@@ -82,7 +82,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<E
     let mut confirmation: Option<PendingConfirmation> = None;
 
     loop {
-        let config = config::load_or_create_config();
+        let config = config::load_or_create_config()?;
         let chats = db::list_chats(&conn).unwrap_or_default();
         let memories = load_memories(&conn);
         let personalization = personalize::load().unwrap_or_default();
@@ -302,7 +302,7 @@ fn render_overview(
     };
     let text = format!(
         "Gateway credential: {}\nModel: {}\nEmbedding model: {}\nAutomatic memory: {}\nTerminal context: {}\nCommand permissions: {}\n\nConfig: {}\nDatabase: {}\nPersonalization: {}",
-        config::gateway_credential_source(),
+        config::gateway_credential_source_for(cfg.gateway_provider),
         model,
         cfg.embedding_model,
         on_off(cfg.memory_enabled && cfg.auto_memory),

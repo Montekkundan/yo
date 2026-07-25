@@ -14,28 +14,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Require distribution token
+      - name: Check distribution token
+        id: distribution
         env:
           DISTRIBUTION_TOKEN: ${{ secrets.DISTRIBUTION_TOKEN }}
         run: |
           if [ -z "$DISTRIBUTION_TOKEN" ]; then
-            echo "::error::Add a DISTRIBUTION_TOKEN repository secret with write access to Montekkundan/yo-bin-aur."
-            exit 1
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping AUR mirror update until DISTRIBUTION_TOKEN has write access to Montekkundan/yo-bin-aur."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Read published version
+        if: steps.distribution.outputs.available == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "VERSION=$(gh api repos/${GITHUB_REPOSITORY}/releases/latest --jq .tag_name)" >> "$GITHUB_ENV"
 
       - name: Checkout AUR package repository
-        uses: actions/checkout@v7
+        if: steps.distribution.outputs.available == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: Montekkundan/yo-bin-aur
           token: ${{ secrets.DISTRIBUTION_TOKEN }}
           path: aur
 
       - name: Download archives and calculate checksums
+        if: steps.distribution.outputs.available == 'true'
         run: |
           set -euo pipefail
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
@@ -47,12 +53,13 @@ jobs:
           echo "ARM64_SHA=$(sha256sum yo-linux-arm64.tar.gz | cut -d ' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Update and validate PKGBUILD
+        if: steps.distribution.outputs.available == 'true'
         run: |
           cat > aur/PKGBUILD <<EOF
           pkgname=yo-bin
           pkgver=${VERSION}
           pkgrel=1
-          pkgdesc="Personal AI terminal assistant powered by Vercel AI Gateway"
+          pkgdesc="Personal AI terminal assistant powered by model gateways"
           arch=('x86_64' 'aarch64')
           url="https://github.com/Montekkundan/yo"
           license=('MIT')
@@ -68,6 +75,7 @@ jobs:
           bash -n aur/PKGBUILD
 
       - name: Commit updated PKGBUILD
+        if: steps.distribution.outputs.available == 'true'
         working-directory: aur
         run: |
           if git diff --quiet -- PKGBUILD; then

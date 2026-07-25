@@ -1,12 +1,24 @@
+// Tests serialize process-environment mutation with `ENVIRONMENT_LOCK`. Rust
+// exposes that mutation as unsafe because concurrent access would be unsound.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
 use clap::Parser;
-use serial_test::serial;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 use yo::cli::{Cli, Command, MemoryCommand, PermissionMode, PersonalizeCommand};
 use yo::config::CommandConfirmation;
 use yo::memory::{MemoryQuery, NewMemory};
+
+static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+fn environment_lock() -> MutexGuard<'static, ()> {
+    ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct TestEnv {
     original: Option<String>,
@@ -38,7 +50,7 @@ impl Drop for TestEnv {
 fn parses_gateway_only_commands() {
     assert!(matches!(
         Cli::try_parse_from(["yo", "setup"]).unwrap().command,
-        Some(Command::Setup)
+        Some(Command::Setup { provider: None })
     ));
     assert!(matches!(
         Cli::try_parse_from(["yo", "models"]).unwrap().command,
@@ -122,8 +134,8 @@ fn parses_all_command_permission_modes() {
 }
 
 #[test]
-#[serial]
 fn config_never_serializes_provider_secrets() {
+    let _lock = environment_lock();
     let _env = TestEnv::new();
     let config = yo::config::Config {
         model: "anthropic/claude-sonnet-4.6".into(),
@@ -137,8 +149,71 @@ fn config_never_serializes_provider_secrets() {
 }
 
 #[test]
-#[serial]
+fn database_backup_and_repair_preserve_a_valid_database() {
+    let _lock = environment_lock();
+    let env = TestEnv::new();
+    let conn = yo::db::init_db().unwrap();
+    yo::db::ensure_session(&conn, "backup-test", "/bin/sh", None, "/tmp", None).unwrap();
+    drop(conn);
+
+    #[cfg(unix)]
+    let original_parent_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&env.root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::metadata(&env.root).unwrap().permissions().mode() & 0o777
+    };
+    let explicit = env.root.join("manual-backup.db");
+    assert_eq!(yo::db::backup_database(Some(&explicit)).unwrap(), explicit);
+    assert!(explicit.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&env.root).unwrap().permissions().mode() & 0o777,
+            original_parent_mode,
+            "an explicit backup must not chmod its existing parent"
+        );
+        assert_eq!(
+            fs::metadata(&explicit).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(yo::db::integrity_check().unwrap(), "ok");
+
+    let report = yo::db::repair_database().unwrap();
+    assert!(report.backup.is_file());
+    assert_eq!(report.integrity_before, "ok");
+    assert_eq!(report.integrity_after, "ok");
+}
+
+#[test]
+fn diagnostics_are_opt_in_and_store_only_bounded_metadata() {
+    let _lock = environment_lock();
+    let _env = TestEnv::new();
+    yo::diagnostics::record(
+        yo::diagnostics::DiagnosticEvent::new("tool.command").outcome(true, 12),
+    );
+    assert!(yo::diagnostics::read_events().unwrap().is_empty());
+
+    let config = yo::config::Config {
+        diagnostics_enabled: true,
+        ..yo::config::Config::default()
+    };
+    yo::config::save_config_result(&config).unwrap();
+    yo::diagnostics::record(
+        yo::diagnostics::DiagnosticEvent::new("tool.command").outcome(true, 12),
+    );
+    let events = yo::diagnostics::read_events().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "tool.command");
+    let encoded = fs::read_to_string(yo::diagnostics::path()).unwrap();
+    assert!(!encoded.contains("stdout"));
+    assert!(!encoded.contains("prompt"));
+}
+
+#[test]
 fn database_and_personalize_file_share_the_private_app_directory() {
+    let _lock = environment_lock();
     let _env = TestEnv::new();
     let _conn = yo::db::init_db().unwrap();
     let personalize = yo::personalize::ensure_exists().unwrap();
@@ -148,8 +223,8 @@ fn database_and_personalize_file_share_the_private_app_directory() {
 }
 
 #[test]
-#[serial]
 fn memory_survives_database_reopen_and_a_new_terminal_session() {
+    let _lock = environment_lock();
     let _env = TestEnv::new();
     {
         let conn = yo::db::init_db().unwrap();
@@ -171,8 +246,8 @@ fn memory_survives_database_reopen_and_a_new_terminal_session() {
 }
 
 #[test]
-#[serial]
 fn full_access_permission_persists_without_serializing_secrets() {
+    let _lock = environment_lock();
     let _env = TestEnv::new();
     let config = yo::config::Config {
         command_confirmation: CommandConfirmation::FullAccess,

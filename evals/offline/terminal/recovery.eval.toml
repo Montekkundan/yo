@@ -1,0 +1,9 @@
+description = "Captures a command failure and successfully runs a follow-up diagnostic."
+kind = "terminal-recovery"
+tags = ["offline", "terminal", "recovery"]
+requires = ["rustc"]
+
+[recovery]
+failure_command = "yo-command-that-must-not-exist-cobalt719"
+recovery_command = "rustc --version"
+recovery_stdout_contains = ["rustc"]

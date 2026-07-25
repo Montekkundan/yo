@@ -1,0 +1,13 @@
+description = "Diagnoses pasted command-not-found context and runs the correct replacement command."
+prompt = "The terminal says `python: command not found`. Diagnose it, run exactly `python3 --version`, and report the real result."
+tags = ["terminal", "tools", "recovery", "python"]
+requires = ["python3"]
+allowed_commands = ["python3 --version"]
+
+[expect]
+tool = "run_command"
+commands = ["python3 --version"]
+exit_code = 0
+stdout_nonempty = true
+stdout_contains = ["Python"]
+reply_nonempty = true

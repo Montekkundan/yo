@@ -14,28 +14,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Require distribution token
+      - name: Check distribution token
+        id: distribution
         env:
           DISTRIBUTION_TOKEN: ${{ secrets.DISTRIBUTION_TOKEN }}
         run: |
           if [ -z "$DISTRIBUTION_TOKEN" ]; then
-            echo "::error::Add a DISTRIBUTION_TOKEN repository secret with write access to Montekkundan/scoop-bucket."
-            exit 1
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping Scoop update until DISTRIBUTION_TOKEN has write access to Montekkundan/scoop-bucket."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Read published version
+        if: steps.distribution.outputs.available == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "VERSION=$(gh api repos/${GITHUB_REPOSITORY}/releases/latest --jq .tag_name)" >> "$GITHUB_ENV"
 
       - name: Checkout Scoop bucket
-        uses: actions/checkout@v7
+        if: steps.distribution.outputs.available == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: Montekkundan/scoop-bucket
           token: ${{ secrets.DISTRIBUTION_TOKEN }}
           path: scoop-bucket
 
       - name: Download archive and calculate checksum
+        if: steps.distribution.outputs.available == 'true'
         run: |
           set -euo pipefail
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/yo-${VERSION}-x86_64-pc-windows-msvc.zip"
@@ -44,6 +50,7 @@ jobs:
           echo "WINDOWS_SHA=$(sha256sum yo-windows.zip | cut -d ' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Update and validate manifest
+        if: steps.distribution.outputs.available == 'true'
         run: |
           jq -n \
             --arg version "$VERSION" \
@@ -51,7 +58,7 @@ jobs:
             --arg hash "$WINDOWS_SHA" \
             '{
               version: $version,
-              description: "Personal AI terminal assistant powered by Vercel AI Gateway",
+              description: "Personal AI terminal assistant powered by model gateways",
               homepage: "https://github.com/Montekkundan/yo",
               license: "MIT",
               architecture: {
@@ -65,6 +72,7 @@ jobs:
           jq empty scoop-bucket/yo.json
 
       - name: Commit updated manifest
+        if: steps.distribution.outputs.available == 'true'
         working-directory: scoop-bucket
         run: |
           if git diff --quiet -- yo.json; then

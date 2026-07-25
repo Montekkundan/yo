@@ -18,10 +18,13 @@ pub enum Command {
         question: Vec<String>,
     },
 
-    #[command(about = "Configure a Vercel AI Gateway credential and model")]
-    Setup,
+    #[command(about = "Configure a model gateway, credential, and local runtime")]
+    Setup {
+        #[arg(long, value_enum, help = "Skip the provider prompt")]
+        provider: Option<GatewayProviderArg>,
+    },
 
-    #[command(subcommand, about = "Manage the Vercel AI Gateway credential")]
+    #[command(subcommand, about = "Manage the configured model gateway credential")]
     Gateway(GatewayCommand),
 
     #[command(about = "Show Yo's local configuration paths")]
@@ -29,11 +32,11 @@ pub enum Command {
 
     #[command(
         visible_alias = "list",
-        about = "List models available through AI Gateway"
+        about = "List models available through the configured gateway"
     )]
     Models,
 
-    #[command(about = "Select a Vercel AI Gateway model")]
+    #[command(about = "Select a chat model from the configured gateway")]
     Model { model: String },
 
     #[command(about = "Show the active model, session, and feature status")]
@@ -104,6 +107,33 @@ pub enum Command {
     #[command(about = "Open the native terminal settings interface")]
     Settings,
 
+    #[command(about = "Check credentials, database, sandboxing, and updates")]
+    Doctor {
+        #[arg(long, help = "Skip network checks")]
+        offline: bool,
+        #[arg(long, help = "Print a machine-readable JSON report")]
+        json: bool,
+    },
+
+    #[command(about = "Install the latest signed GitHub release")]
+    Update {
+        #[arg(long, help = "Only report whether an update is available")]
+        check: bool,
+    },
+
+    #[command(
+        visible_alias = "db",
+        subcommand,
+        about = "Back up and repair local data"
+    )]
+    Database(DatabaseCommand),
+
+    #[command(subcommand, about = "Manage opt-in, local-only diagnostic metrics")]
+    Diagnostics(DiagnosticsCommand),
+
+    #[command(subcommand, about = "Manage OS-level command sandbox scopes")]
+    Sandbox(SandboxCommand),
+
     #[command(about = "Run file-based agent workflow evals")]
     Eval {
         #[arg(value_name = "FILTER", help = "Eval id or directory prefix to run")]
@@ -142,6 +172,27 @@ pub enum PermissionMode {
     FullAccess,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum GatewayProviderArg {
+    Vercel,
+    #[value(alias = "llmgateway")]
+    LlmGateway,
+    OpenRouter,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum SandboxModeArg {
+    Auto,
+    Required,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum NetworkAccessArg {
+    Deny,
+    Allow,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommand {
     List,
@@ -168,8 +219,53 @@ pub enum PersonalizeCommand {
 #[derive(Subcommand, Debug)]
 pub enum GatewayCommand {
     Status,
-    Set,
+    Set {
+        #[arg(value_enum)]
+        provider: Option<GatewayProviderArg>,
+    },
     Delete,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DatabaseCommand {
+    Backup {
+        #[arg(value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+    Repair,
+    Integrity,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DiagnosticsCommand {
+    Status,
+    On,
+    Off,
+    Export,
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SandboxCommand {
+    Status,
+    Mode {
+        #[arg(value_enum)]
+        mode: SandboxModeArg,
+        #[arg(long, help = "Confirm disabling OS isolation non-interactively")]
+        yes: bool,
+    },
+    Network {
+        #[arg(value_enum)]
+        access: NetworkAccessArg,
+    },
+    AddRead {
+        path: PathBuf,
+    },
+    AddWrite {
+        path: PathBuf,
+    },
+    ClearScopes,
+    Reset,
 }
 
 #[cfg(test)]
@@ -208,6 +304,35 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Gateway(GatewayCommand::Delete))
+        ));
+    }
+
+    #[test]
+    fn setup_provider_and_operational_commands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["yo", "setup", "--provider", "open-router"])
+                .unwrap()
+                .command,
+            Some(Command::Setup {
+                provider: Some(GatewayProviderArg::OpenRouter)
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["yo", "doctor", "--offline", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::Doctor {
+                offline: true,
+                json: true
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["yo", "sandbox", "network", "deny"])
+                .unwrap()
+                .command,
+            Some(Command::Sandbox(SandboxCommand::Network {
+                access: NetworkAccessArg::Deny
+            }))
         ));
     }
 

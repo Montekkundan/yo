@@ -1,0 +1,34 @@
+name: nightly offline evals
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-evals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: offline reliability
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      YO_EVAL_REQUIRE_OFFLINE_TARGETS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@ab40b01f54fe82bdf65693ea090a1e4942c136e7 # 1.91.1
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Run deterministic evals
+        run: ./target/release/yo eval offline --json > offline-report.json
+      - name: Upload offline report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: eval-offline
+          path: offline-report.json

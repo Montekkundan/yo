@@ -4,20 +4,20 @@
 [![crates.io](https://img.shields.io/crates/v/yo.svg)](https://crates.io/crates/yo)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-Yo is a personal AI assistant for your terminal. It uses [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) for every model request and keeps chats, terminal context, personalization, and durable memory on your machine.
+Yo is a personal AI assistant for your terminal. It can use [Vercel AI Gateway](https://vercel.com/docs/ai-gateway), [LLM Gateway](https://docs.llmgateway.io), or [OpenRouter](https://openrouter.ai/docs) for model requests, while chats, terminal context, personalization, diagnostics, and durable memory stay on your machine.
 
 ## What it does
 
 - Ask with `yo <question>` or `yo ask <question>`
-- Choose a tool- and structured-output-compatible text model exposed by Vercel AI Gateway
+- Choose a tool- and structured-output-compatible model from one supported gateway
 - Render Markdown with terminal-aware wrapping, code blocks, lists, and colors
-- Run commands and return their real output
+- Run commands inside OS-enforced filesystem and network scopes
 - Keep a separate chat for each terminal session
 - Recall compact global and repository-specific memories across sessions
 - Follow your own `personalize.md` response instructions
 - Manage settings, chats, and memories from a native Rust TUI
 
-Yo does not contain direct provider integrations or a local-model backend. Chat, structured memory extraction, and embeddings all go through AI Gateway.
+Yo does not contain direct model-provider integrations or a local-model backend. Chat, structured memory extraction, and embeddings all use the gateway selected during setup.
 
 ## Install
 
@@ -42,7 +42,7 @@ Or from this repository:
 cargo install --path .
 ```
 
-## Set up AI Gateway
+## Set up a model gateway
 
 Run:
 
@@ -50,9 +50,17 @@ Run:
 yo setup
 ```
 
-That is the whole setup. If Yo cannot find an existing Gateway key or OIDC token, it asks for one and stores it in the operating system credential store—never in `config.toml` or SQLite. It then:
+Yo asks you to choose Vercel AI Gateway, LLM Gateway, or OpenRouter. You can also select one non-interactively:
 
-- loads Vercel's live model catalog;
+```sh
+yo setup --provider vercel
+yo setup --provider llm-gateway
+yo setup --provider open-router
+```
+
+If Yo cannot find that gateway's environment variable, it asks for a key and stores it in the operating system credential store—never in `config.toml` or SQLite. It then:
+
+- loads the selected gateway's live model catalog;
 - keeps a valid existing model or selects a recommended live chat and embedding model;
 - makes tiny tool-call, structured-output, and embedding requests to verify the credential, credits, and models;
 - initializes local chats, memory, and `personalize.md`; and
@@ -62,12 +70,19 @@ Rerunning `yo setup` is safe and does not duplicate the shell hook. Use `yo mode
 
 Use `yo gateway status`, `yo gateway set`, or `yo gateway delete` to inspect, replace, or remove the stored credential without ever printing it.
 
-For CI or temporary use, set either:
+For CI or temporary use, set the variable for your selected gateway:
 
 ```sh
+# Vercel AI Gateway
 export AI_GATEWAY_API_KEY='...'
-# or
+# or Vercel OIDC
 export VERCEL_OIDC_TOKEN='...'
+
+# LLM Gateway
+export LLM_GATEWAY_API_KEY='...'
+
+# OpenRouter
+export OPENROUTER_API_KEY='...'
 ```
 
 ## One chat per terminal
@@ -120,9 +135,28 @@ yo permissions full-access
 
 - `safe` allows only an exact, recognized read-only command from the current request without asking. Unknown, sensitive, mutating, or dangerous commands prompt for `y/N`.
 - `always-ask` prompts for every model-proposed command.
-- `full-access` never prompts. Enabling it requires an explicit warning confirmation; use it only when you trust the model with your normal user permissions.
+- `full-access` never prompts. Enabling it requires an explicit warning confirmation. OS sandbox scopes still apply.
 
-`yo run -- ...` is always a direct user instruction and is not affected by these model approval modes.
+`yo run -- ...` is always a direct user instruction and is not affected by these approval modes. It is still subject to the configured OS sandbox.
+
+### Command sandbox
+
+On macOS, Yo uses Seatbelt. On Linux, it uses Bubblewrap (`bwrap`). Model-proposed commands fail closed when isolation is unavailable; explicit `yo run` commands use best-effort isolation in `auto` mode. Use `required` when even explicit commands must fail closed.
+
+The current working directory is writable by default, additional scopes are opt-in, and child processes cannot see gateway keys or common secret environment variables. Network access is denied by default.
+
+```sh
+yo sandbox status
+yo sandbox mode required
+yo sandbox add-read ~/Developer/shared
+mkdir -p /tmp/yo-output
+yo sandbox add-write /tmp/yo-output
+yo sandbox network allow
+yo sandbox clear-scopes
+yo sandbox reset
+```
+
+Install Bubblewrap with your Linux package manager if `yo doctor` reports that it is missing. Windows currently has no supported OS sandbox backend, so `required` mode and model-proposed commands fail closed there.
 
 A normal CLI cannot portably read arbitrary terminal scrollback. The shell integration supplies the previous command, exit status, and directory. Use `yo run`, or pipe real output into a question, when Yo needs the exact error text:
 
@@ -139,6 +173,8 @@ Yo includes Rust-native, file-based evals inspired by [Eve's eval model](https:/
 cargo run -- eval --list
 cargo run -- eval terminal/node-version --verbose
 cargo run -- eval terminal --json
+cargo run -- eval offline --json
+cargo run -- eval adversarial --json
 ```
 
 Eval ids come from files under `evals/`, so `evals/terminal/nvm-list.eval.toml` becomes `terminal/nvm-list`. A directory prefix runs the whole group. A failed gate exits non-zero; a missing local prerequisite such as `nvm` is reported as skipped.
@@ -164,6 +200,8 @@ reply_nonempty = true
 
 Running an eval performs live Gateway requests and may consume a small amount of credit. `yo eval --list` does not require a credential or call a model.
 
+The deterministic offline suites cover FTS and vector memory precision/recall, secret redaction, and failed-command recovery. Live cases cover automatic-memory filtering, prompt injection, destructive-command containment, real command use, and model-driven recovery from terminal errors. Nightly CI runs the credential-free offline gate. Maintainers run the paid multi-model suite locally before a release, so no Gateway key needs to be stored in GitHub Actions.
+
 ## Terminal formatting
 
 AI responses are Markdown. Interactive terminals receive wrapped, styled output similar in spirit to [Glow](https://github.com/charmbracelet/glow), implemented directly in the Rust binary. Redirected output stays as portable Markdown. `NO_COLOR=1`, `CLICOLOR=0`, and `TERM=dumb` are respected.
@@ -188,6 +226,34 @@ It has **Overview**, **Chats**, **Memory**, and **Personalize** tabs. Use:
 - `q` or Esc to quit.
 
 Every setting also has a normal CLI command, so Yo remains scriptable and usable in a minimal terminal.
+
+### Health, updates, backups, and diagnostics
+
+```sh
+yo doctor                 # credentials, gateway, DB, sandbox, updater, local files
+yo doctor --offline       # skip Gateway and release-network checks
+yo doctor --json          # machine-readable health report
+
+yo update --check
+yo update                 # verify SHA-256 plus Sigstore/GitHub provenance, then replace Yo
+
+yo database integrity
+yo database backup
+yo database backup ./yo-backup.db
+yo database repair        # creates an untouched backup before repair
+```
+
+`yo update` refuses to replace the binary unless either `cosign` validates the release workflow's Sigstore identity or `gh attestation verify` validates GitHub provenance. Package-manager installations can still be upgraded through their package manager.
+
+Diagnostics are off by default and stay local. They contain fixed event names, success booleans, timings, provider names, and HTTP status codes—never prompts, command text, output, paths, memories, model replies, or credentials.
+
+```sh
+yo diagnostics status
+yo diagnostics on
+yo diagnostics export
+yo diagnostics clear
+yo diagnostics off
+```
 
 ### Chats
 
@@ -258,22 +324,56 @@ Yo follows the private `personalize.md` file on every request. You can also say 
 ## Security and privacy
 
 - Gateway credentials live in the OS credential store or environment.
-- Gateway requests set `disallowPromptTraining`.
+- Vercel requests set `disallowPromptTraining`; privacy and retention controls for other gateways follow the selected gateway account and provider policy.
 - Local configuration and data use owner-only permissions where supported.
 - Captured command output is size-limited and redacted before storage or model use.
-- Commands run with your normal user permissions and are not an operating-system sandbox. Only a recognized read-only command written explicitly in the user's request can run without confirmation; unknown, mutating, dangerous, or model-invented commands always require confirmation.
+- Commands use Seatbelt on macOS or Bubblewrap on Linux with explicit filesystem/network scopes. Model commands fail closed without a backend unless sandboxing is deliberately disabled.
+- Approval policy and OS isolation are independent: `full-access` skips prompts but does not disable the sandbox.
 - Memory deletion removes its text, embedding, FTS row, and provenance. `yo memory purge` also checkpoints and vacuums SQLite.
 - Existing installations are migrated; legacy plaintext credentials are removed from configuration.
+
+Release archives are smoke-tested on every published target, checksummed, keylessly signed through Sigstore, accompanied by a CycloneDX SBOM, and attested by GitHub Actions. CI also runs `cargo audit` and `cargo deny`.
+
+GitHub releases use the built-in `GITHUB_TOKEN` and OIDC identity, so they need no custom secret. Add `CARGO_REGISTRY_TOKEN` only when publishing the crate to crates.io. `DISTRIBUTION_TOKEN` is only needed for the optional AUR and Scoop publication workflows. Gateway keys stay local: nightly CI is deterministic and credential-free, while maintainers run paid multi-model evals locally before tagging.
+
+Verify a downloaded release manually:
+
+```sh
+sha256sum -c SHA256SUMS
+gh attestation verify yo-2.0.0-x86_64-unknown-linux-musl.tar.gz \
+  -R Montekkundan/yo \
+  --signer-workflow Montekkundan/yo/.github/workflows/release.yml \
+  --source-ref refs/tags/2.0.0 \
+  --cert-identity "https://github.com/Montekkundan/yo/.github/workflows/release.yml@refs/tags/2.0.0" \
+  --deny-self-hosted-runners
+cosign verify-blob yo-2.0.0-x86_64-unknown-linux-musl.tar.gz \
+  --bundle yo-2.0.0-x86_64-unknown-linux-musl.tar.gz.sigstore.json \
+  --certificate-identity "https://github.com/Montekkundan/yo/.github/workflows/release.yml@refs/tags/2.0.0" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The release gates and measurable targets for tool success, memory precision, secret retention, startup time, and Gateway latency are documented in [docs/reliability.md](docs/reliability.md).
 
 ## Development
 
 ```sh
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo doc --locked --no-deps --all-features --document-private-items
 cargo test --all
+cargo audit
+cargo deny check
 cargo build --release
 cargo package --locked
 ```
+
+Or run the complete local quality gate:
+
+```sh
+./scripts/check.sh
+```
+
+The repository pins Rust 1.91.1, denies unsafe application code and Rustdoc errors, treats all standard Clippy warnings as errors, pins third-party workflow actions to immutable revisions, and uses checked-in Rustfmt and EditorConfig rules. See [CONTRIBUTING.md](CONTRIBUTING.md) for the code and documentation conventions.
 
 ### Test this checkout without using an installed `yo`
 
@@ -291,6 +391,10 @@ To include isolated end-to-end setup, live workflow evals, automatic cross-sessi
 export AI_GATEWAY_API_KEY='your-key'
 YO_LIVE_TEST=1 ./scripts/test-local.sh
 ```
+
+The harness also detects `LLM_GATEWAY_API_KEY` and `OPENROUTER_API_KEY`. Set
+`YO_TEST_PROVIDER=llm-gateway` or `YO_TEST_PROVIDER=open-router` to choose one
+explicitly when more than one credential is present.
 
 The live test stores and recalls a unique memory from a different terminal session, then lets the model create a proof file under the temporary test directory. It may consume a small amount of Gateway credit.
 

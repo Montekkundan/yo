@@ -1,5 +1,5 @@
 class YoBin < Formula
-  desc "Personal AI terminal assistant powered by Vercel AI Gateway"
+  desc "Personal AI terminal assistant powered by model gateways"
   homepage "https://github.com/montekkundan/yo"
   version "1.3.5"
 

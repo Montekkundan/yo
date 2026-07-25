@@ -1,0 +1,16 @@
+description = "Retrieves a durable command through the vector path when the query has no lexical overlap."
+kind = "memory"
+tags = ["offline", "memory", "vector", "accuracy"]
+
+[memory]
+query = "how do I inspect the editor extensions"
+relevant = ["Run colon Lazy to inspect installed Neovim packages"]
+distractors = [
+  "Use nvm list to show installed Node.js versions",
+  "Docker containers are listed with docker ps",
+  "Python reports its runtime with python3 --version",
+]
+top_k = 1
+min_precision = 1.0
+min_recall = 1.0
+use_vector = true

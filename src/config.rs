@@ -5,11 +5,81 @@ use std::path::{Path, PathBuf};
 
 const KEYRING_SERVICE: &str = "yo-ai-gateway";
 const KEYRING_ACCOUNT: &str = "default";
+const PROVIDER_KEYRING_SERVICE: &str = "yo-gateway";
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GatewayProvider {
+    #[default]
+    Vercel,
+    LlmGateway,
+    OpenRouter,
+}
+
+impl GatewayProvider {
+    pub const ALL: [Self; 3] = [Self::Vercel, Self::LlmGateway, Self::OpenRouter];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vercel => "vercel",
+            Self::LlmGateway => "llmgateway",
+            Self::OpenRouter => "openrouter",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Vercel => "Vercel AI Gateway",
+            Self::LlmGateway => "LLM Gateway",
+            Self::OpenRouter => "OpenRouter",
+        }
+    }
+
+    pub fn base_url(self) -> &'static str {
+        match self {
+            Self::Vercel => "https://ai-gateway.vercel.sh/v1",
+            Self::LlmGateway => "https://api.llmgateway.io/v1",
+            Self::OpenRouter => "https://openrouter.ai/api/v1",
+        }
+    }
+
+    pub fn key_url(self) -> &'static str {
+        match self {
+            Self::Vercel => "https://vercel.com/ai-gateway",
+            Self::LlmGateway => "https://llmgateway.io",
+            Self::OpenRouter => "https://openrouter.ai/keys",
+        }
+    }
+
+    pub fn environment_variables(self) -> &'static [&'static str] {
+        match self {
+            Self::Vercel => &["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"],
+            Self::LlmGateway => &["LLM_GATEWAY_API_KEY", "LLMGATEWAY_API_KEY"],
+            Self::OpenRouter => &["OPENROUTER_API_KEY"],
+        }
+    }
+}
+
+impl std::fmt::Display for GatewayProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.display_name())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    #[default]
+    Auto,
+    Required,
+    Off,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
-    /// Vercel AI Gateway model ID in `creator/model` form.
+    pub gateway_provider: GatewayProvider,
+    /// Model ID as returned by the selected gateway.
     pub model: String,
     pub embedding_model: String,
     pub memory_enabled: bool,
@@ -18,6 +88,11 @@ pub struct Config {
     pub max_terminal_output_bytes: usize,
     pub max_history_messages: usize,
     pub command_confirmation: CommandConfirmation,
+    pub sandbox_mode: SandboxMode,
+    pub sandbox_network: bool,
+    pub sandbox_read_paths: Vec<PathBuf>,
+    pub sandbox_write_paths: Vec<PathBuf>,
+    pub diagnostics_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +124,7 @@ impl CommandConfirmation {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            gateway_provider: GatewayProvider::Vercel,
             model: String::new(),
             embedding_model: "openai/text-embedding-3-small".into(),
             memory_enabled: true,
@@ -57,6 +133,11 @@ impl Default for Config {
             max_terminal_output_bytes: 16 * 1024,
             max_history_messages: 24,
             command_confirmation: CommandConfirmation::Smart,
+            sandbox_mode: SandboxMode::Auto,
+            sandbox_network: false,
+            sandbox_read_paths: Vec::new(),
+            sandbox_write_paths: Vec::new(),
+            diagnostics_enabled: false,
         }
     }
 }
@@ -82,11 +163,8 @@ pub fn load_config() -> Result<Config> {
     load_config_from(&get_config_path())
 }
 
-pub fn load_or_create_config() -> Config {
-    load_config().unwrap_or_else(|error| {
-        eprintln!("warning: could not load config: {error}");
-        Config::default()
-    })
+pub fn load_or_create_config() -> Result<Config> {
+    load_config()
 }
 
 fn load_config_from(path: &Path) -> Result<Config> {
@@ -102,10 +180,21 @@ fn load_config_from(path: &Path) -> Result<Config> {
     let had_legacy_source = raw.get("source").is_some();
 
     let mut config = Config::default();
+    if let Some(provider) = raw.get("gateway_provider").and_then(toml::Value::as_str) {
+        config.gateway_provider = match provider {
+            "vercel" => GatewayProvider::Vercel,
+            "llmgateway" | "llm-gateway" => GatewayProvider::LlmGateway,
+            "openrouter" | "open-router" => GatewayProvider::OpenRouter,
+            other => anyhow::bail!(
+                "invalid gateway_provider {other:?} in {}; expected vercel, llm-gateway, or openrouter",
+                path.display()
+            ),
+        };
+    }
     if let Some(model) = raw.get("model").and_then(toml::Value::as_str) {
         // Old direct-provider model names are not valid Gateway IDs. Do not
         // silently guess a provider; setup will offer the live model list.
-        if model.contains('/') {
+        if !model.trim().is_empty() && (!had_legacy_source || model.contains('/')) {
             config.model = model.to_owned();
         }
     }
@@ -143,12 +232,55 @@ fn load_config_from(path: &Path) -> Result<Config> {
         .and_then(toml::Value::as_str)
     {
         config.command_confirmation = match value {
+            "smart" | "safe" => CommandConfirmation::Smart,
             "always" | "always-ask" => CommandConfirmation::Always,
             "full-access" => CommandConfirmation::FullAccess,
-            _ => CommandConfirmation::Smart,
+            other => anyhow::bail!(
+                "invalid command_confirmation {other:?} in {}; expected smart, always, or full-access",
+                path.display()
+            ),
         };
     }
-
+    if let Some(value) = raw.get("sandbox_mode").and_then(toml::Value::as_str) {
+        config.sandbox_mode = match value {
+            "auto" => SandboxMode::Auto,
+            "required" => SandboxMode::Required,
+            "off" => SandboxMode::Off,
+            other => anyhow::bail!(
+                "invalid sandbox_mode {other:?} in {}; expected auto, required, or off",
+                path.display()
+            ),
+        };
+    }
+    if let Some(value) = raw.get("sandbox_network").and_then(toml::Value::as_bool) {
+        config.sandbox_network = value;
+    }
+    if let Some(values) = raw
+        .get("sandbox_read_paths")
+        .and_then(toml::Value::as_array)
+    {
+        config.sandbox_read_paths = values
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(PathBuf::from)
+            .collect();
+    }
+    if let Some(values) = raw
+        .get("sandbox_write_paths")
+        .and_then(toml::Value::as_array)
+    {
+        config.sandbox_write_paths = values
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(PathBuf::from)
+            .collect();
+    }
+    if let Some(value) = raw
+        .get("diagnostics_enabled")
+        .and_then(toml::Value::as_bool)
+    {
+        config.diagnostics_enabled = value;
+    }
     if had_legacy_secret || had_legacy_source {
         backup_legacy_config(path, &raw)?;
         save_config_to(path, &config)?;
@@ -200,49 +332,83 @@ fn save_config_to(path: &Path, config: &Config) -> Result<()> {
 
 /// Credential lookup order matches Vercel's CLI guidance: an explicit Gateway
 /// key, then an OIDC token, then the native credential store.
-pub fn gateway_credential() -> Result<String> {
-    for name in ["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"] {
+pub fn gateway_credential_for(provider: GatewayProvider) -> Result<String> {
+    for name in provider.environment_variables() {
         if let Ok(value) = std::env::var(name) {
             if !value.trim().is_empty() {
                 return Ok(value);
             }
         }
     }
-    keyring_entry()?
-        .get_password()
-        .context("no Vercel AI Gateway credential found; run `yo setup` or set AI_GATEWAY_API_KEY")
+    if let Ok(value) = provider_keyring_entry(provider)?.get_password() {
+        return Ok(value);
+    }
+    if provider == GatewayProvider::Vercel {
+        if let Ok(value) = legacy_keyring_entry()?.get_password() {
+            return Ok(value);
+        }
+    }
+    anyhow::bail!(
+        "no {} credential found; run `yo setup` or set {}",
+        provider.display_name(),
+        provider.environment_variables()[0]
+    )
 }
 
-pub fn store_gateway_credential(secret: &str) -> Result<()> {
+pub fn gateway_credential() -> Result<String> {
+    gateway_credential_for(load_or_create_config()?.gateway_provider)
+}
+
+pub fn store_gateway_credential_for(provider: GatewayProvider, secret: &str) -> Result<()> {
     if secret.trim().is_empty() {
         anyhow::bail!("the Gateway credential cannot be empty");
     }
-    keyring_entry()?
+    provider_keyring_entry(provider)?
         .set_password(secret.trim())
         .context("failed to save the Gateway credential in the OS credential store")
 }
 
-pub fn delete_gateway_credential() -> Result<()> {
-    keyring_entry()?
+pub fn store_gateway_credential(secret: &str) -> Result<()> {
+    store_gateway_credential_for(load_or_create_config()?.gateway_provider, secret)
+}
+
+pub fn delete_gateway_credential_for(provider: GatewayProvider) -> Result<()> {
+    provider_keyring_entry(provider)?
         .delete_credential()
         .context("failed to delete the Gateway credential from the OS credential store")
 }
 
-pub fn gateway_credential_source() -> &'static str {
-    if std::env::var_os("AI_GATEWAY_API_KEY").is_some() {
-        "AI_GATEWAY_API_KEY"
-    } else if std::env::var_os("VERCEL_OIDC_TOKEN").is_some() {
-        "VERCEL_OIDC_TOKEN"
-    } else if gateway_credential().is_ok() {
-        "OS credential store"
+pub fn delete_gateway_credential() -> Result<()> {
+    delete_gateway_credential_for(load_or_create_config()?.gateway_provider)
+}
+
+pub fn gateway_credential_source_for(provider: GatewayProvider) -> String {
+    if let Some(name) = provider
+        .environment_variables()
+        .iter()
+        .find(|name| std::env::var_os(name).is_some())
+    {
+        (*name).to_owned()
+    } else if gateway_credential_for(provider).is_ok() {
+        "OS credential store".to_owned()
     } else {
-        "not configured"
+        "not configured".to_owned()
     }
 }
 
-fn keyring_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+pub fn gateway_credential_source() -> Result<String> {
+    let provider = load_or_create_config()?.gateway_provider;
+    Ok(gateway_credential_source_for(provider))
+}
+
+fn provider_keyring_entry(provider: GatewayProvider) -> Result<keyring::Entry> {
+    keyring::Entry::new(PROVIDER_KEYRING_SERVICE, provider.as_str())
         .context("failed to open the OS credential store")
+}
+
+fn legacy_keyring_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .context("failed to open the legacy OS credential store")
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -320,5 +486,33 @@ mod tests {
         save_config_to(&path, &config).unwrap();
         assert_eq!(load_config_from(&path).unwrap(), config);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn gateway_provider_and_unprefixed_model_round_trip() {
+        let path = temporary_path();
+        let config = Config {
+            gateway_provider: GatewayProvider::LlmGateway,
+            model: "gpt-5.4-mini".into(),
+            ..Config::default()
+        };
+        save_config_to(&path, &config).unwrap();
+        assert_eq!(load_config_from(&path).unwrap(), config);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_security_sensitive_values_are_rejected() {
+        for source in [
+            "gateway_provider = \"unknown\"\n",
+            "command_confirmation = \"full-acess\"\n",
+            "sandbox_mode = \"requred\"\n",
+        ] {
+            let path = temporary_path();
+            fs::write(&path, source).unwrap();
+            let error = load_config_from(&path).unwrap_err().to_string();
+            assert!(error.contains("invalid"), "unexpected error: {error}");
+            let _ = fs::remove_file(path);
+        }
     }
 }

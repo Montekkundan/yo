@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Route all chat, tool, structured-output, and embedding requests through Vercel AI Gateway.
+- Route all chat, tool, structured-output, and embedding requests through a selected Vercel AI Gateway, LLM Gateway, or OpenRouter account.
 - Add terminal-session chats, command execution with captured results, terminal Markdown rendering, local hybrid memory, `personalize.md`, and a native settings TUI.
 - Make `yo setup` automatically select live chat and embedding models, verify tool calling, strict structured output, and embeddings with real requests, initialize local state, and install shell integration idempotently.
 - Harden model command authorization with exact-command consent and timeouts, bound automatic-memory retries, and preserve privacy when chats are cleared.
@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Show TTY-aware Gateway and command progress with the latest redacted shell output, use lightweight pyenv/nvm command bootstraps, and prevent approved commands or leftover child processes from hanging capture.
 - Keep successful command answers minimal and remove background highlighting from terminal code rendering.
 - Gate GitHub releases on successful builds for every release target.
+- Add OS-level filesystem/network sandboxing, `yo doctor`, verified in-place updates, database backup/repair, and opt-in local diagnostics.
+- Add adversarial, memory, redaction, recovery, credential-free nightly, and maintainer-run multi-model evals with published reliability targets.
+- Add dependency audits, artifact installation tests, CycloneDX SBOMs, GitHub provenance, and keyless Sigstore release signatures.
 - Remove direct-provider and local-model runtime integrations.
 
 ## [1.0.1] - 2025-04-25

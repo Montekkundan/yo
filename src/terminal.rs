@@ -6,6 +6,7 @@
 //! request. Model-initiated execution can use [`classify_command`] first and
 //! require confirmation when appropriate.
 
+use crate::sandbox::{self, CommandSpec, SandboxPolicy};
 use std::collections::VecDeque;
 use std::env;
 use std::fmt;
@@ -339,6 +340,7 @@ pub struct RunRequest {
     pub shell: Option<PathBuf>,
     pub capture_limit_bytes: usize,
     pub timeout: Option<Duration>,
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 impl fmt::Debug for RunRequest {
@@ -350,6 +352,7 @@ impl fmt::Debug for RunRequest {
             .field("shell", &self.shell)
             .field("capture_limit_bytes", &self.capture_limit_bytes)
             .field("timeout", &self.timeout)
+            .field("sandbox", &self.sandbox.as_ref().map(|policy| policy.mode))
             .finish()
     }
 }
@@ -379,6 +382,7 @@ impl RunRequest {
             shell: None,
             capture_limit_bytes: DEFAULT_CAPTURE_LIMIT_BYTES,
             timeout: None,
+            sandbox: None,
         })
     }
 
@@ -397,6 +401,7 @@ impl RunRequest {
             shell: None,
             capture_limit_bytes: DEFAULT_CAPTURE_LIMIT_BYTES,
             timeout: None,
+            sandbox: None,
         })
     }
 
@@ -417,6 +422,11 @@ impl RunRequest {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_sandbox(mut self, policy: SandboxPolicy) -> Self {
+        self.sandbox = Some(policy);
         self
     }
 }
@@ -582,8 +592,14 @@ where
     let shell = request.shell.clone().unwrap_or_else(user_shell);
     let cwd = resolve_cwd(request.cwd.as_deref())?;
     let mut command = command_for_request(&shell, &request.input);
+    command.current_dir(&cwd);
+    if let Some(policy) = &request.sandbox {
+        let spec = CommandSpec::from_command(&command, &cwd);
+        command = sandbox::prepare(&spec, policy)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .into_command();
+    }
     command
-        .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1032,6 +1048,22 @@ pub fn redact_secrets(input: &str) -> String {
     if token_start < input.len() {
         output.push_str(&redact_token(&input[token_start..], &mut state));
     }
+    redact_sensitive_environment_values(output)
+}
+
+fn redact_sensitive_environment_values(mut output: String) -> String {
+    let mut values = env::vars()
+        .filter_map(|(name, value)| {
+            let normalized = name.to_ascii_uppercase();
+            (crate::sandbox::is_sensitive_environment_name(&normalized) && value.len() >= 8)
+                .then_some(value)
+        })
+        .collect::<Vec<_>>();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    for value in values {
+        output = output.replace(&value, "[REDACTED]");
+    }
     output
 }
 
@@ -1162,6 +1194,9 @@ fn is_sensitive_key(key: &str) -> bool {
         || key.ends_with("_secret")
         || key.ends_with("_secret_key")
         || key.ends_with("_session_token")
+        || key.ends_with("_token")
+        || key.ends_with("_database_url")
+        || key.ends_with("_connection_string")
 }
 
 fn is_sensitive_flag(value: &str) -> bool {
@@ -1734,6 +1769,9 @@ const fn assessment(risk: CommandRisk, reason: &'static str) -> CommandAssessmen
 }
 
 #[cfg(test)]
+// These tests serialize process-environment mutation with `ENV_LOCK`. Rust
+// exposes that mutation as unsafe because concurrent access would be unsound.
+#[allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -1949,6 +1987,17 @@ mod tests {
         assert!(!redacted.contains("qrstuvwx"));
         assert!(redacted.contains("normal output"));
         assert!(redacted.matches("[REDACTED]").count() >= 4);
+    }
+
+    #[test]
+    fn redaction_removes_generic_token_environment_values_even_when_printed_raw() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = env::var("NPM_TOKEN").ok();
+        unsafe { env::set_var("NPM_TOKEN", "npm-secret-value-123") };
+        let redacted = redact_secrets("npm-secret-value-123\nNPM_TOKEN=npm-secret-value-123");
+        assert!(!redacted.contains("npm-secret-value-123"));
+        assert_eq!(redacted.matches("[REDACTED]").count(), 2);
+        restore_env("NPM_TOKEN", previous);
     }
 
     #[test]

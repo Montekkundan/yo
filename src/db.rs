@@ -1,6 +1,7 @@
 use crate::config::get_app_dir;
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension, Result};
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +45,90 @@ pub struct NewTerminalEvent<'a> {
 
 pub fn get_db_path() -> PathBuf {
     get_app_dir().join("chats.db")
+}
+
+pub fn default_backup_path() -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    get_app_dir()
+        .join("backups")
+        .join(format!("yo-{timestamp}.db"))
+}
+
+pub fn backup_database(output: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let uses_default_directory = output.is_none();
+    let destination = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_backup_path);
+    if destination.exists() {
+        anyhow::bail!("backup already exists: {}", destination.display());
+    }
+    if let Some(parent) = destination.parent() {
+        let parent_existed = parent.is_dir();
+        fs::create_dir_all(parent)?;
+        if uses_default_directory || !parent_existed {
+            set_private_directory_permissions(parent)?;
+        }
+    }
+    let conn = init_db()?;
+    conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+    create_private_backup_file(&destination)?;
+    if let Err(error) = conn.backup(DatabaseName::Main, &destination, None) {
+        let _ = fs::remove_file(&destination);
+        return Err(error.into());
+    }
+    set_private_backup_permissions(&destination)?;
+    Ok(destination)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairReport {
+    pub backup: PathBuf,
+    pub integrity_before: String,
+    pub integrity_after: String,
+}
+
+pub fn integrity_check() -> anyhow::Result<String> {
+    let conn = init_db()?;
+    integrity_check_connection(&conn)
+}
+
+pub fn integrity_check_existing() -> anyhow::Result<String> {
+    let path = get_db_path();
+    if !path.is_file() {
+        anyhow::bail!("database does not exist; run `yo setup`");
+    }
+    // FTS5's integrity validation may update its internal validation state even
+    // though this helper does not run migrations or change user data.
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    integrity_check_connection(&conn)
+}
+
+pub fn repair_database() -> anyhow::Result<RepairReport> {
+    let backup = backup_database(None)?;
+    let conn = init_db()?;
+    let integrity_before = integrity_check_connection(&conn)?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); REINDEX; PRAGMA optimize; VACUUM;")?;
+    let integrity_after = integrity_check_connection(&conn)?;
+    if integrity_after != "ok" {
+        anyhow::bail!(
+            "database still fails integrity checks after repair; untouched backup: {} ({})",
+            backup.display(),
+            integrity_after
+        );
+    }
+    Ok(RepairReport {
+        backup,
+        integrity_before,
+        integrity_after,
+    })
+}
+
+fn integrity_check_connection(conn: &Connection) -> anyhow::Result<String> {
+    Ok(conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?)
 }
 
 pub fn init_db() -> Result<Connection> {
@@ -486,6 +571,35 @@ fn set_private_permissions(_path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o600));
     }
+}
+
+fn create_private_backup_file(path: &Path) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map(drop)
+}
+
+fn set_private_backup_permissions(_path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn set_private_directory_permissions(_path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

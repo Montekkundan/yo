@@ -1,0 +1,15 @@
+description = "Retrieves a precise command memory without returning unrelated terminal facts."
+kind = "memory"
+tags = ["offline", "memory", "accuracy"]
+
+[memory]
+query = "cobalt719 nvim package listing"
+relevant = ["cobalt719: use :Lazy to list installed nvim packages"]
+distractors = [
+  "Use nvm list to show installed Node.js versions",
+  "Docker containers are listed with docker ps",
+  "The preferred editor theme is catppuccin",
+]
+top_k = 3
+min_precision = 0.90
+min_recall = 1.0

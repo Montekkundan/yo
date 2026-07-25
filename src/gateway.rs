@@ -1,10 +1,12 @@
-//! Minimal native client for Vercel AI Gateway's OpenAI-compatible API.
+//! Minimal native client for supported OpenAI-compatible model gateways.
 //!
 //! The client deliberately keeps provider credentials and conversation storage out
-//! of this module. It authenticates with an AI Gateway API key, always requests
-//! that providers do not train on prompt data, and exposes both buffered and SSE
-//! chat-completion APIs.
+//! of this module. It authenticates with the selected gateway key and exposes
+//! buffered and SSE chat-completion APIs. Vercel-specific privacy routing is
+//! sent only when Vercel AI Gateway is selected.
 
+use crate::config::GatewayProvider;
+use crate::diagnostics::{self, DiagnosticEvent};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
@@ -14,6 +16,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
+use std::time::Instant;
 
 pub const DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,24 +80,24 @@ impl fmt::Display for GatewayError {
         match self {
             Self::Transport(error) => write!(
                 f,
-                "could not reach Vercel AI Gateway: {error}. Check your network and gateway base URL"
+                "could not reach the configured model gateway: {error}. Check your network and gateway settings"
             ),
             Self::Decode { context, source } => {
-                write!(f, "AI Gateway returned invalid {context} JSON: {source}")
+                write!(f, "the gateway returned invalid {context} JSON: {source}")
             }
             Self::Authentication { details } => write!(
                 f,
-                "AI Gateway authentication failed (401). Check or replace your AI Gateway API key. {details}"
+                "Gateway authentication failed (401). Check or replace the configured gateway key. {details}"
             ),
             Self::PaymentRequired { details } => write!(
                 f,
-                "AI Gateway credits or budget are exhausted (402). Add credits or raise the key budget. {details}"
+                "Gateway credits or budget are exhausted (402). Add credits or raise the key budget. {details}"
             ),
             Self::RateLimited {
                 details,
                 retry_after,
             } => {
-                write!(f, "AI Gateway rate limit exceeded (429).")?;
+                write!(f, "Gateway rate limit exceeded (429).")?;
                 if let Some(value) = retry_after {
                     write!(f, " Retry after {value}.")?;
                 } else {
@@ -104,12 +107,12 @@ impl fmt::Display for GatewayError {
             }
             Self::Api { status, details } => write!(
                 f,
-                "AI Gateway request failed with HTTP {status}. Verify the model ID and request settings. {details}"
+                "Gateway request failed with HTTP {status}. Verify the model ID and request settings. {details}"
             ),
             Self::Capability { details } => {
-                write!(f, "AI Gateway model capability check failed: {details}")
+                write!(f, "Gateway model capability check failed: {details}")
             }
-            Self::Stream { details } => write!(f, "AI Gateway stream failed: {details}"),
+            Self::Stream { details } => write!(f, "Gateway stream failed: {details}"),
         }
     }
 }
@@ -135,6 +138,7 @@ pub struct GatewayClient {
     http: Client,
     api_key: String,
     base_url: String,
+    provider: GatewayProvider,
 }
 
 impl fmt::Debug for GatewayClient {
@@ -142,12 +146,17 @@ impl fmt::Debug for GatewayClient {
         f.debug_struct("GatewayClient")
             .field("api_key", &"[redacted]")
             .field("base_url", &self.base_url)
+            .field("provider", &self.provider)
             .finish_non_exhaustive()
     }
 }
 
 impl GatewayClient {
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::for_provider(GatewayProvider::Vercel, api_key)
+    }
+
+    pub fn for_provider(provider: GatewayProvider, api_key: impl Into<String>) -> Self {
         Self {
             http: Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
@@ -155,17 +164,24 @@ impl GatewayClient {
                 .build()
                 .expect("valid built-in Gateway HTTP client configuration"),
             api_key: api_key.into(),
-            base_url: DEFAULT_BASE_URL.to_owned(),
+            base_url: if provider == GatewayProvider::Vercel {
+                DEFAULT_BASE_URL
+            } else {
+                provider.base_url()
+            }
+            .to_owned(),
+            provider,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self::with_http_client(api_key, base_url, Client::new())
+        Self::with_http_client(GatewayProvider::Vercel, api_key, base_url, Client::new())
     }
 
     #[cfg(test)]
     fn with_http_client(
+        provider: GatewayProvider,
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         http: Client,
@@ -174,34 +190,40 @@ impl GatewayClient {
             http,
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            provider,
         }
     }
 
     pub async fn list_models(&self) -> GatewayResult<Vec<GatewayModel>> {
-        let response = self
-            .http
-            .get(self.endpoint("models"))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-        let response = require_success(response).await?;
-        let body = response.bytes().await?;
-        let list: ModelList = decode_json(&body, "model-list")?;
-        Ok(list.data)
+        let mut models = self.fetch_models("models").await?;
+        if self.provider == GatewayProvider::OpenRouter {
+            if let Ok(embedding_models) = self.fetch_models("embeddings/models").await {
+                for model in embedding_models {
+                    if !models.iter().any(|existing| existing.id == model.id) {
+                        models.push(model);
+                    }
+                }
+            }
+        }
+        Ok(models)
     }
 
     pub async fn chat(&self, request: &ChatRequest) -> GatewayResult<ChatResponse> {
-        let wire = ChatRequestWire::new(request, false);
+        let started = Instant::now();
+        let mut status_code = None;
+        let wire = ChatRequestWire::new(request, false, self.provider == GatewayProvider::Vercel);
         let response = self
-            .http
-            .post(self.endpoint("chat/completions"))
-            .bearer_auth(&self.api_key)
-            .json(&wire)
-            .send()
-            .await?;
-        let response = require_success(response).await?;
-        let body = response.bytes().await?;
-        decode_json(&body, "chat-completion")
+            .request(self.http.post(self.endpoint("chat/completions")))
+            .json(&wire);
+        let result = async {
+            let response = self.send(response).await?;
+            status_code = Some(response.status().as_u16());
+            let body = response.bytes().await?;
+            decode_json(&body, "chat-completion")
+        }
+        .await;
+        self.record_completion("chat", started, status_code, &result);
+        result
     }
 
     /// Streams chat chunks to `on_chunk` and also returns an aggregated first choice.
@@ -213,54 +235,120 @@ impl GatewayClient {
     where
         F: FnMut(&ChatChunk),
     {
-        let wire = ChatRequestWire::new(request, true);
+        let started = Instant::now();
+        let mut status_code = None;
+        let wire = ChatRequestWire::new(request, true, self.provider == GatewayProvider::Vercel);
         let response = self
-            .http
-            .post(self.endpoint("chat/completions"))
-            .bearer_auth(&self.api_key)
-            .json(&wire)
-            .send()
-            .await?;
-        let response = require_success(response).await?;
-        let mut bytes = response.bytes_stream();
-        let mut decoder = SseDecoder::default();
-        let mut accumulator = StreamAccumulator::default();
+            .request(self.http.post(self.endpoint("chat/completions")))
+            .json(&wire);
+        let result = async {
+            let response = self.send(response).await?;
+            status_code = Some(response.status().as_u16());
+            let mut bytes = response.bytes_stream();
+            let mut decoder = SseDecoder::default();
+            let mut accumulator = StreamAccumulator::default();
+            let mut recorded_first_chunk = false;
 
-        while let Some(chunk) = bytes.next().await {
-            for event in decoder.push(&chunk?)? {
+            while let Some(chunk) = bytes.next().await {
+                let chunk = chunk?;
+                if !recorded_first_chunk {
+                    diagnostics::record(
+                        DiagnosticEvent::new("gateway.ttft.chat")
+                            .outcome(true, started.elapsed().as_millis())
+                            .gateway(self.provider, status_code),
+                    );
+                    recorded_first_chunk = true;
+                }
+                for event in decoder.push(&chunk)? {
+                    if process_stream_event(event, &mut accumulator, &mut on_chunk)? {
+                        return Ok(accumulator.finish());
+                    }
+                }
+            }
+
+            for event in decoder.finish()? {
                 if process_stream_event(event, &mut accumulator, &mut on_chunk)? {
                     return Ok(accumulator.finish());
                 }
             }
-        }
 
-        for event in decoder.finish()? {
-            if process_stream_event(event, &mut accumulator, &mut on_chunk)? {
-                return Ok(accumulator.finish());
-            }
+            Err(GatewayError::Stream {
+                details: "connection closed before the required `data: [DONE]` event".to_owned(),
+            })
         }
-
-        Err(GatewayError::Stream {
-            details: "connection closed before the required `data: [DONE]` event".to_owned(),
-        })
+        .await;
+        self.record_completion("chat", started, status_code, &result);
+        result
     }
 
     pub async fn embeddings(&self, request: &EmbeddingRequest) -> GatewayResult<EmbeddingResponse> {
-        let wire = EmbeddingRequestWire::new(request);
+        let started = Instant::now();
+        let mut status_code = None;
+        let wire = EmbeddingRequestWire::new(request, self.provider == GatewayProvider::Vercel);
         let response = self
-            .http
-            .post(self.endpoint("embeddings"))
-            .bearer_auth(&self.api_key)
-            .json(&wire)
-            .send()
-            .await?;
-        let response = require_success(response).await?;
-        let body = response.bytes().await?;
-        decode_json(&body, "embedding")
+            .request(self.http.post(self.endpoint("embeddings")))
+            .json(&wire);
+        let result = async {
+            let response = self.send(response).await?;
+            status_code = Some(response.status().as_u16());
+            let body = response.bytes().await?;
+            decode_json(&body, "embedding")
+        }
+        .await;
+        self.record_completion("embedding", started, status_code, &result);
+        result
     }
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path.trim_start_matches('/'))
+    }
+
+    async fn fetch_models(&self, path: &str) -> GatewayResult<Vec<GatewayModel>> {
+        let started = Instant::now();
+        let mut status_code = None;
+        let response = self.request(self.http.get(self.endpoint(path)));
+        let result = async {
+            let response = self.send(response).await?;
+            status_code = Some(response.status().as_u16());
+            let body = response.bytes().await?;
+            let list: ModelList = decode_json(&body, "model-list")?;
+            Ok(list.data)
+        }
+        .await;
+        self.record_completion("models", started, status_code, &result);
+        result
+    }
+
+    fn request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let builder = builder.bearer_auth(&self.api_key);
+        if self.provider == GatewayProvider::OpenRouter {
+            builder
+                .header("HTTP-Referer", "https://github.com/Montekkundan/yo")
+                .header("X-OpenRouter-Title", "Yo")
+        } else {
+            builder
+        }
+    }
+
+    async fn send(&self, builder: reqwest::RequestBuilder) -> GatewayResult<Response> {
+        require_success(builder.send().await?).await
+    }
+
+    fn record_completion<T>(
+        &self,
+        operation: &str,
+        started: Instant,
+        status_code: Option<u16>,
+        result: &GatewayResult<T>,
+    ) {
+        let success = result.is_ok();
+        let status_code =
+            status_code.or_else(|| result.as_ref().err().and_then(GatewayError::status_code));
+        diagnostics::record(
+            DiagnosticEvent::new(format!("gateway.complete.{operation}"))
+                .outcome(success, started.elapsed().as_millis())
+                .gateway(self.provider, status_code),
+        );
     }
 }
 
@@ -681,12 +769,12 @@ struct ChatRequestWire<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     stream: bool,
-    #[serde(rename = "providerOptions")]
-    provider_options: ProviderOptionsWire<'a>,
+    #[serde(rename = "providerOptions", skip_serializing_if = "Option::is_none")]
+    provider_options: Option<ProviderOptionsWire<'a>>,
 }
 
 impl<'a> ChatRequestWire<'a> {
-    fn new(request: &'a ChatRequest, stream: bool) -> Self {
+    fn new(request: &'a ChatRequest, stream: bool, include_provider_options: bool) -> Self {
         Self {
             model: &request.model,
             messages: &request.messages,
@@ -696,7 +784,8 @@ impl<'a> ChatRequestWire<'a> {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             stream,
-            provider_options: ProviderOptionsWire::new(&request.gateway),
+            provider_options: include_provider_options
+                .then(|| ProviderOptionsWire::new(&request.gateway)),
         }
     }
 }
@@ -709,18 +798,19 @@ struct EmbeddingRequestWire<'a> {
     encoding_format: Option<&'a EmbeddingEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dimensions: Option<u32>,
-    #[serde(rename = "providerOptions")]
-    provider_options: ProviderOptionsWire<'a>,
+    #[serde(rename = "providerOptions", skip_serializing_if = "Option::is_none")]
+    provider_options: Option<ProviderOptionsWire<'a>>,
 }
 
 impl<'a> EmbeddingRequestWire<'a> {
-    fn new(request: &'a EmbeddingRequest) -> Self {
+    fn new(request: &'a EmbeddingRequest, include_provider_options: bool) -> Self {
         Self {
             model: &request.model,
             input: &request.input,
             encoding_format: request.encoding_format.as_ref(),
             dimensions: request.dimensions,
-            provider_options: ProviderOptionsWire::new(&request.gateway),
+            provider_options: include_provider_options
+                .then(|| ProviderOptionsWire::new(&request.gateway)),
         }
     }
 }
@@ -1270,6 +1360,40 @@ mod tests {
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
         assert_eq!(body["stream"], true);
         assert!(body.get("response_format").is_none());
+    }
+
+    #[tokio::test]
+    async fn openrouter_uses_attribution_headers_without_vercel_options() {
+        let response = TestResponse::json(json!({
+            "id": "chat-1",
+            "model": "openai/gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        }));
+        let (base_url, captured) = spawn_server(response).await;
+        let client = GatewayClient::with_http_client(
+            GatewayProvider::OpenRouter,
+            "openrouter-test-key",
+            base_url,
+            Client::new(),
+        );
+        client
+            .chat(&ChatRequest::new(
+                "openai/gpt-test",
+                vec![ChatMessage::user("hello")],
+            ))
+            .await
+            .unwrap();
+        let captured = captured.await.unwrap();
+        let request = String::from_utf8_lossy(&captured).to_ascii_lowercase();
+        let body = request_json(&captured);
+
+        assert!(request.contains("http-referer: https://github.com/montekkundan/yo"));
+        assert!(request.contains("x-openrouter-title: yo"));
+        assert!(body.get("providerOptions").is_none());
     }
 
     #[tokio::test]

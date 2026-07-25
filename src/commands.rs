@@ -1,8 +1,11 @@
 use crate::cli::{
-    GatewayCommand, MemoryCommand, PermissionMode, PersonalizeCommand, ShellKind as CliShellKind,
+    DatabaseCommand, DiagnosticsCommand, GatewayCommand, GatewayProviderArg, MemoryCommand,
+    NetworkAccessArg, PermissionMode, PersonalizeCommand, SandboxCommand, SandboxModeArg,
+    ShellKind as CliShellKind,
 };
-use crate::config::{self, CommandConfirmation, Config};
+use crate::config::{self, CommandConfirmation, Config, GatewayProvider, SandboxMode};
 use crate::db;
+use crate::diagnostics::{self, DiagnosticEvent};
 use crate::gateway::{
     ChatMessage, ChatRequest, EmbeddingInput, EmbeddingRequest, EmbeddingVector, GatewayClient,
     GatewayError, GatewayModel, GatewayOptions, MessageRole, ToolChoice, ToolDefinition,
@@ -11,13 +14,16 @@ use crate::memory::{
     self, AddMemoryOutcome, ClearScope, Embedding, EmbeddingUpdate, ListOptions, MemoryQuery,
     MemoryScope, MemorySensitivity, MemoryUpdate, NewMemory, NewMemoryJob,
 };
+use crate::sandbox::{
+    FilesystemScopes, NetworkScope, SandboxMode as RuntimeSandboxMode, SandboxPolicy,
+};
 use crate::{personalize, render, terminal, tui};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PREFERRED_CHAT_MODELS: &[&str] = &[
@@ -26,8 +32,12 @@ const PREFERRED_CHAT_MODELS: &[&str] = &[
     "openai/gpt-5.4",
     "openai/gpt-5.4-mini",
     "google/gemini-3-flash",
+    "claude-sonnet-4.6",
+    "gpt-5.4",
+    "gpt-5.4-mini",
 ];
-const PREFERRED_EMBEDDING_MODELS: &[&str] = &["openai/text-embedding-3-small"];
+const PREFERRED_EMBEDDING_MODELS: &[&str] =
+    &["openai/text-embedding-3-small", "text-embedding-3-small"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SetupCredentialKind {
@@ -36,33 +46,45 @@ enum SetupCredentialKind {
     Prompted,
 }
 
-pub async fn setup() -> Result<()> {
+pub async fn setup(requested_provider: Option<GatewayProviderArg>) -> Result<()> {
     println!("Setting up Yo…");
-    let mut settings = config::load_or_create_config();
-    let (mut credential, mut credential_kind) = match config::gateway_credential() {
+    let mut settings = config::load_or_create_config()?;
+    let provider = match requested_provider {
+        Some(provider) => gateway_provider(provider),
+        None if io::stdin().is_terminal() && io::stdout().is_terminal() => {
+            prompt_gateway_provider(settings.gateway_provider)?
+        }
+        None => settings.gateway_provider,
+    };
+    let (mut credential, mut credential_kind) = match config::gateway_credential_for(provider) {
         Ok(value) => {
-            let kind = if gateway_environment_configured() {
+            let kind = if gateway_environment_configured(provider) {
                 SetupCredentialKind::Environment
             } else {
                 SetupCredentialKind::Stored
             };
             (value, kind)
         }
-        Err(_) => (prompt_gateway_credential()?, SetupCredentialKind::Prompted),
+        Err(_) => (
+            prompt_gateway_credential(provider)?,
+            SetupCredentialKind::Prompted,
+        ),
     };
 
     let (model, embedding_model) = loop {
-        let client = GatewayClient::new(credential.clone());
+        let client = GatewayClient::for_provider(provider, credential.clone());
         match prepare_gateway_setup(&client, &settings).await {
             Ok(selection) => break selection,
             Err(error) if gateway_status(&error) == Some(401) => match credential_kind {
                 SetupCredentialKind::Stored => {
                     println!("The saved Gateway key was rejected. Enter a replacement.");
-                    credential = prompt_gateway_credential()?;
+                    credential = prompt_gateway_credential(provider)?;
                     credential_kind = SetupCredentialKind::Prompted;
                 }
                 SetupCredentialKind::Environment => anyhow::bail!(
-                    "the Gateway credential in AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN was rejected; update or unset that environment variable, then run `yo setup` again"
+                    "the {} credential in {} was rejected; update or unset it, then run `yo setup` again",
+                    provider.display_name(),
+                    provider.environment_variables().join(" or ")
                 ),
                 SetupCredentialKind::Prompted => {
                     return Err(error).context("the Gateway key was rejected");
@@ -73,10 +95,13 @@ pub async fn setup() -> Result<()> {
     };
 
     if credential_kind == SetupCredentialKind::Prompted {
-        config::store_gateway_credential(&credential).context(
-            "the Gateway credential was valid but could not be saved; on a headless system, set AI_GATEWAY_API_KEY and rerun `yo setup`",
+        config::store_gateway_credential_for(provider, &credential).with_context(|| format!(
+            "the Gateway credential was valid but could not be saved; on a headless system, set {} and rerun `yo setup`",
+            provider.environment_variables()[0]
+        )
         )?;
     }
+    settings.gateway_provider = provider;
     settings.model = model.clone();
     settings.embedding_model = embedding_model.clone();
     config::save_config_result(&settings)?;
@@ -92,6 +117,7 @@ pub async fn setup() -> Result<()> {
         None
     };
 
+    println!("✓ Gateway: {}", provider.display_name());
     println!("✓ Gateway credential accepted");
     println!("✓ Chat model: {model}");
     println!("✓ Memory model: {embedding_model}");
@@ -99,6 +125,20 @@ pub async fn setup() -> Result<()> {
         "✓ Command permissions: {} (`yo permissions` to change)",
         settings.command_confirmation.as_str()
     );
+    match crate::sandbox::detect_backend() {
+        Some(backend) => println!(
+            "✓ Command sandbox: {} (network {}; `yo sandbox` to change)",
+            backend.name(),
+            if settings.sandbox_network {
+                "allowed"
+            } else {
+                "denied"
+            }
+        ),
+        None => println!(
+            "• Command sandbox unavailable; model commands fail closed (`yo doctor` for details)"
+        ),
+    }
     println!("✓ Local chats, memory, and personalize.md initialized");
     match shell_install {
         Some(status) if status.path.is_some() => {
@@ -289,13 +329,13 @@ fn choose_setup_models(models: &[GatewayModel], config: &Config) -> Result<(Stri
         .collect::<Vec<_>>();
 
     let model = select_setup_model(&language_models, &config.model, PREFERRED_CHAT_MODELS)
-        .context("AI Gateway returned no language models")?;
+        .context("the configured gateway returned no language models")?;
     let embedding_model = select_setup_model(
         &embedding_models,
         &config.embedding_model,
         PREFERRED_EMBEDDING_MODELS,
     )
-    .context("AI Gateway returned no embedding models required for memory")?;
+    .context("the configured gateway returned no embedding models required for memory")?;
     Ok((model, embedding_model))
 }
 
@@ -446,20 +486,51 @@ fn gateway_status(error: &anyhow::Error) -> Option<u16> {
         .and_then(GatewayError::status_code)
 }
 
-fn gateway_environment_configured() -> bool {
-    ["AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"]
+fn gateway_environment_configured(provider: GatewayProvider) -> bool {
+    provider
+        .environment_variables()
         .iter()
         .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
 
-fn prompt_gateway_credential() -> Result<String> {
-    if !io::stdin().is_terminal() {
-        anyhow::bail!(
-            "no Gateway credential found; set AI_GATEWAY_API_KEY or run `yo setup` in an interactive terminal"
+fn prompt_gateway_provider(current: GatewayProvider) -> Result<GatewayProvider> {
+    println!("Choose a model gateway:");
+    for (index, provider) in GatewayProvider::ALL.iter().enumerate() {
+        let current_marker = if *provider == current {
+            " (current)"
+        } else {
+            ""
+        };
+        println!(
+            "  {}. {}{}",
+            index + 1,
+            provider.display_name(),
+            current_marker
         );
     }
-    println!("Create a key at https://vercel.com/ai-gateway");
-    let value = rpassword::prompt_password("Vercel AI Gateway key: ")?;
+    print!("Gateway [1-3, Enter keeps {}]: ", current.display_name());
+    io::stdout().flush()?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    match value.trim() {
+        "" => Ok(current),
+        "1" | "vercel" => Ok(GatewayProvider::Vercel),
+        "2" | "llmgateway" | "llm-gateway" => Ok(GatewayProvider::LlmGateway),
+        "3" | "openrouter" | "open-router" => Ok(GatewayProvider::OpenRouter),
+        _ => anyhow::bail!("choose 1, 2, or 3"),
+    }
+}
+
+fn prompt_gateway_credential(provider: GatewayProvider) -> Result<String> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "no {} credential found; set {} or run `yo setup` in an interactive terminal",
+            provider.display_name(),
+            provider.environment_variables()[0]
+        );
+    }
+    println!("Create a key at {}", provider.key_url());
+    let value = rpassword::prompt_password(format!("{} key: ", provider.display_name()))?;
     if value.trim().is_empty() {
         anyhow::bail!("setup cancelled: the Gateway key was empty");
     }
@@ -469,39 +540,44 @@ fn prompt_gateway_credential() -> Result<String> {
 pub async fn gateway_command(command: GatewayCommand) -> Result<()> {
     match command {
         GatewayCommand::Status => {
+            let settings = config::load_or_create_config()?;
+            println!("Gateway: {}", settings.gateway_provider.display_name());
             println!(
-                "Gateway credential: {}",
-                config::gateway_credential_source()
+                "Credential: {}",
+                config::gateway_credential_source_for(settings.gateway_provider)
             );
         }
-        GatewayCommand::Set => {
-            if gateway_environment_configured() {
+        GatewayCommand::Set { provider } => {
+            let mut settings = config::load_or_create_config()?;
+            let provider = provider
+                .map(gateway_provider)
+                .unwrap_or(settings.gateway_provider);
+            if gateway_environment_configured(provider) {
                 anyhow::bail!(
-                    "the active Gateway credential comes from AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN; update or unset that environment variable instead"
+                    "the active {} credential comes from {}; update or unset that environment variable instead",
+                    provider.display_name(),
+                    provider.environment_variables().join(" or ")
                 );
             }
-            let value = prompt_gateway_credential()?;
-            let mut settings = config::load_or_create_config();
-            let (model, embedding_model) =
-                prepare_gateway_setup(&GatewayClient::new(value.clone()), &settings).await?;
-            config::store_gateway_credential(&value)?;
-            if settings.model != model || settings.embedding_model != embedding_model {
-                settings.model = model;
-                settings.embedding_model = embedding_model;
-                config::save_config_result(&settings)?;
-            }
+            let value = prompt_gateway_credential(provider)?;
+            let client = GatewayClient::for_provider(provider, value.clone());
+            let (model, embedding_model) = prepare_gateway_setup(&client, &settings).await?;
+            config::store_gateway_credential_for(provider, &value)?;
+            settings.gateway_provider = provider;
+            settings.model = model;
+            settings.embedding_model = embedding_model;
+            config::save_config_result(&settings)?;
             println!("Gateway credential checked and saved in the OS credential store");
         }
         GatewayCommand::Delete => {
-            if std::env::var_os("AI_GATEWAY_API_KEY").is_some()
-                || std::env::var_os("VERCEL_OIDC_TOKEN").is_some()
-            {
+            let settings = config::load_or_create_config()?;
+            if gateway_environment_configured(settings.gateway_provider) {
                 anyhow::bail!(
                     "the active credential comes from the environment; unset it in your shell"
                 );
             }
             if confirm("Delete Yo's Gateway credential from the OS credential store?")? {
-                config::delete_gateway_credential()?;
+                config::delete_gateway_credential_for(settings.gateway_provider)?;
                 println!("Gateway credential deleted");
             }
         }
@@ -513,11 +589,12 @@ pub fn show_config_paths() {
     println!("config:      {}", config::get_config_path().display());
     println!("database:    {}", db::get_db_path().display());
     println!("personalize: {}", personalize::path().display());
+    println!("diagnostics: {}", diagnostics::path().display());
 }
 
 pub async fn list_models() -> Result<()> {
     let client = gateway_client()?;
-    let config = config::load_or_create_config();
+    let config = config::load_or_create_config()?;
     let mut models = client.list_models().await?;
     models.sort_by(|left, right| left.id.cmp(&right.id));
     for model in models.into_iter().filter(is_language_model) {
@@ -528,19 +605,16 @@ pub async fn list_models() -> Result<()> {
 }
 
 pub async fn set_model(model: &str) -> Result<()> {
-    if !model.contains('/') {
-        anyhow::bail!("Gateway models use creator/model IDs; run `yo models`");
-    }
     let client = gateway_client()?;
     let models = client.list_models().await?;
     let Some(selected) = models.iter().find(|item| item.id == model) else {
-        anyhow::bail!("model `{model}` is not currently available through AI Gateway");
+        anyhow::bail!("model `{model}` is not currently available through the configured gateway");
     };
     if !is_language_model(selected) {
         anyhow::bail!("model `{model}` is not a chat/language model");
     }
     validate_chat_model(&client, model, "model-selection").await?;
-    let mut value = config::load_or_create_config();
+    let mut value = config::load_or_create_config()?;
     value.model = model.to_owned();
     config::save_config_result(&value)?;
     println!("Using {model}");
@@ -548,24 +622,38 @@ pub async fn set_model(model: &str) -> Result<()> {
 }
 
 pub fn show_current() -> Result<()> {
-    let config = config::load_or_create_config();
+    let config = config::load_or_create_config()?;
     let conn = initialized_db()?;
     let session = session_context(&conn)?;
     println!(
         "model:       {}",
         configured_model(&config).unwrap_or("not selected")
     );
-    println!("gateway key: {}", config::gateway_credential_source());
+    println!("gateway:     {}", config.gateway_provider.display_name());
+    println!(
+        "gateway key: {}",
+        config::gateway_credential_source_for(config.gateway_provider)
+    );
     println!("session:     {}", session.id);
     println!("chat:        {}", session.chat_id);
     println!("memory:      {}", on_off(config.memory_enabled));
     println!("terminal:    {}", on_off(config.terminal_context_enabled));
     println!("permissions: {}", config.command_confirmation.as_str());
+    println!("sandbox:     {}", sandbox_mode_name(config.sandbox_mode));
+    println!(
+        "network:     {}",
+        if config.sandbox_network {
+            "allowed"
+        } else {
+            "denied"
+        }
+    );
+    println!("diagnostics: {}", on_off(config.diagnostics_enabled));
     Ok(())
 }
 
 pub fn permissions(mode: Option<PermissionMode>, yes: bool) -> Result<()> {
-    let mut config = config::load_or_create_config();
+    let mut config = config::load_or_create_config()?;
     let Some(mode) = mode else {
         println!(
             "Command permissions: {}",
@@ -573,7 +661,7 @@ pub fn permissions(mode: Option<PermissionMode>, yes: bool) -> Result<()> {
         );
         println!("  safe        exact recognized read-only commands may run; ask for the rest");
         println!("  always-ask  ask before every model-proposed command");
-        println!("  full-access never ask; commands run with your normal user permissions");
+        println!("  full-access never ask; configured OS sandbox scopes still apply");
         return Ok(());
     };
     let selected = match mode {
@@ -582,7 +670,7 @@ pub fn permissions(mode: Option<PermissionMode>, yes: bool) -> Result<()> {
         PermissionMode::FullAccess => {
             if !yes
                 && !confirm(
-                    "Full access lets the model run any command as your user without asking. Enable it?",
+                    "Full access skips approval prompts. Configured OS sandbox scopes still apply. Enable it?",
                 )?
             {
                 println!("Command permissions unchanged");
@@ -607,11 +695,12 @@ pub fn print_shell_init(shell: CliShellKind) {
 }
 
 pub fn run_command(arguments: &[String]) -> Result<()> {
-    let config = config::load_or_create_config();
+    let config = config::load_or_create_config()?;
     let conn = initialized_db()?;
     let session = session_context(&conn)?;
     let request = terminal::RunRequest::from_cli_args(arguments.iter().cloned())?
-        .with_capture_limit(config.max_terminal_output_bytes);
+        .with_capture_limit(config.max_terminal_output_bytes)
+        .with_sandbox(command_sandbox_policy(&config, false)?);
     let command = terminal::redact_secrets(&arguments.join(" "));
     let progress = render::ProgressLine::new(format!("Running `{command}`"));
     let mut output = String::new();
@@ -644,6 +733,9 @@ pub fn run_command(arguments: &[String]) -> Result<()> {
         }
     };
     let safe = result.safe_for_display();
+    diagnostics::record(
+        DiagnosticEvent::new("command.explicit").outcome(safe.success, safe.duration.as_millis()),
+    );
     save_terminal_result(&conn, &session.id, &safe)?;
     print!("{safe}");
     Ok(())
@@ -670,7 +762,7 @@ pub(crate) enum CommandApproval<'a> {
 }
 
 pub async fn ask(question: &[String], private: bool) -> Result<()> {
-    let config = config::load_or_create_config();
+    let config = config::load_or_create_config()?;
     let direct_question = question.join(" ").trim().to_owned();
     let explicit_personalization = explicitly_requests_personalization(&direct_question);
     let mut prompt = direct_question.clone();
@@ -922,7 +1014,7 @@ pub(crate) async fn run_assistant_turn(
     }
 
     if final_content.trim().is_empty() {
-        anyhow::bail!("AI Gateway returned no final response after tool execution");
+        anyhow::bail!("the configured gateway returned no final response after tool execution");
     }
     Ok(AgentTurnOutcome {
         reply: final_content,
@@ -995,7 +1087,8 @@ fn execute_tool(
                 .context("run_command did not include a command")?;
             let request = terminal::RunRequest::shell_script(command)?
                 .with_capture_limit(config.max_terminal_output_bytes)
-                .with_timeout(std::time::Duration::from_secs(120));
+                .with_timeout(std::time::Duration::from_secs(120))
+                .with_sandbox(command_sandbox_policy(config, true)?);
             match approval {
                 CommandApproval::AllowOnly(commands)
                     if !commands
@@ -1059,6 +1152,10 @@ fn execute_tool(
                 }
             };
             let safe = result.safe_for_display();
+            diagnostics::record(
+                DiagnosticEvent::new("tool.command")
+                    .outcome(safe.success, safe.duration.as_millis()),
+            );
             let event_id = save_terminal_result(conn, &session.id, &safe)?;
             Ok(json!({
                 "ok": true,
@@ -1367,6 +1464,29 @@ If a new fact directly replaces one of the listed active memories, set replaces_
     Ok(())
 }
 
+pub(crate) async fn extract_memories_for_eval(
+    conn: &Connection,
+    gateway: &GatewayClient,
+    config: &Config,
+    user: &str,
+    assistant: &str,
+    source_message_id: i64,
+) -> Result<()> {
+    extract_and_store_memories(
+        conn,
+        gateway,
+        config,
+        MemoryExtraction {
+            user,
+            assistant: Some(assistant),
+            repo: None,
+            source_message_id,
+            existing_memories: &[],
+        },
+    )
+    .await
+}
+
 async fn process_one_pending_memory_job(
     conn: &Connection,
     gateway: &GatewayClient,
@@ -1486,7 +1606,7 @@ pub fn search_chats(query: &[String]) -> Result<()> {
 
 pub async fn remember(text: &[String]) -> Result<()> {
     let text = terminal::redact_secrets(&text.join(" "));
-    let config = config::load_or_create_config();
+    let config = config::load_or_create_config()?;
     let gateway = gateway_client()?;
     let conn = initialized_db()?;
     let session = session_context(&conn)?;
@@ -1521,7 +1641,7 @@ pub async fn memory_command(command: MemoryCommand) -> Result<()> {
         }
         MemoryCommand::Search { query } => {
             let text = terminal::redact_secrets(&query.join(" "));
-            let config = config::load_or_create_config();
+            let config = config::load_or_create_config()?;
             let embedding = if let Ok(gateway) = gateway_client() {
                 embed_text(&gateway, &config.embedding_model, &text)
                     .await
@@ -1589,13 +1709,13 @@ pub async fn memory_command(command: MemoryCommand) -> Result<()> {
         }
         MemoryCommand::Reindex => reindex_memories(&conn).await?,
         MemoryCommand::On => {
-            let mut value = config::load_or_create_config();
+            let mut value = config::load_or_create_config()?;
             value.memory_enabled = true;
             config::save_config_result(&value)?;
             println!("Memory is on");
         }
         MemoryCommand::Off => {
-            let mut value = config::load_or_create_config();
+            let mut value = config::load_or_create_config()?;
             value.memory_enabled = false;
             config::save_config_result(&value)?;
             println!("Memory is off");
@@ -1605,7 +1725,7 @@ pub async fn memory_command(command: MemoryCommand) -> Result<()> {
 }
 
 async fn reindex_memories(conn: &Connection) -> Result<()> {
-    let config = config::load_or_create_config();
+    let config = config::load_or_create_config()?;
     let gateway = gateway_client()?;
     let memories = memory::list_memories(conn, &ListOptions::default())?;
     let total = memories.len();
@@ -1657,7 +1777,19 @@ pub fn settings() -> Result<()> {
 }
 
 fn gateway_client() -> Result<GatewayClient> {
-    Ok(GatewayClient::new(config::gateway_credential()?))
+    let settings = config::load_or_create_config()?;
+    Ok(GatewayClient::for_provider(
+        settings.gateway_provider,
+        config::gateway_credential_for(settings.gateway_provider)?,
+    ))
+}
+
+fn gateway_provider(provider: GatewayProviderArg) -> GatewayProvider {
+    match provider {
+        GatewayProviderArg::Vercel => GatewayProvider::Vercel,
+        GatewayProviderArg::LlmGateway => GatewayProvider::LlmGateway,
+        GatewayProviderArg::OpenRouter => GatewayProvider::OpenRouter,
+    }
 }
 
 fn initialized_db() -> Result<Connection> {
@@ -1864,6 +1996,241 @@ fn command_progress_message(action: &str, command: &str, output: &str) -> String
     }
 }
 
+pub fn database_command(command: DatabaseCommand) -> Result<()> {
+    match command {
+        DatabaseCommand::Backup { output } => {
+            let path = db::backup_database(output.as_deref())?;
+            println!("Backup: {}", path.display());
+        }
+        DatabaseCommand::Repair => {
+            let report = db::repair_database()?;
+            println!("Database: {}", report.integrity_after);
+            println!("Backup: {}", report.backup.display());
+        }
+        DatabaseCommand::Integrity => println!("{}", db::integrity_check()?),
+    }
+    Ok(())
+}
+
+pub fn diagnostics_command(command: DiagnosticsCommand) -> Result<()> {
+    match command {
+        DiagnosticsCommand::Status => {
+            let settings = config::load_or_create_config()?;
+            let events = diagnostics::read_events()?;
+            let summary = diagnostics::summary(&events);
+            println!("Diagnostics: {}", on_off(settings.diagnostics_enabled));
+            println!("Events: {}", summary.events);
+            println!("File: {}", diagnostics::path().display());
+            print_optional_rate("Tool success", summary.tool_success_rate);
+            print_optional_rate("Gateway success", summary.gateway_success_rate);
+            print_optional_duration("Gateway p50", summary.gateway_latency_p50_ms);
+            print_optional_duration("Gateway p95", summary.gateway_latency_p95_ms);
+            print_optional_duration("Startup p95", summary.startup_p95_ms);
+        }
+        DiagnosticsCommand::On | DiagnosticsCommand::Off => {
+            let mut settings = config::load_or_create_config()?;
+            settings.diagnostics_enabled = matches!(command, DiagnosticsCommand::On);
+            config::save_config_result(&settings)?;
+            println!("Diagnostics: {}", on_off(settings.diagnostics_enabled));
+        }
+        DiagnosticsCommand::Export => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&diagnostics::read_events()?)?
+            );
+        }
+        DiagnosticsCommand::Clear => {
+            if confirm("Clear local diagnostic metrics?")? {
+                diagnostics::clear()?;
+                println!("Diagnostics cleared");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn sandbox_command(command: SandboxCommand) -> Result<()> {
+    let mut settings = config::load_or_create_config()?;
+    match command {
+        SandboxCommand::Status => {
+            println!("Mode: {}", sandbox_mode_name(settings.sandbox_mode));
+            println!(
+                "Backend: {}",
+                crate::sandbox::detect_backend()
+                    .map(|backend| backend.name())
+                    .unwrap_or("unavailable")
+            );
+            println!(
+                "Network: {}",
+                if settings.sandbox_network {
+                    "allowed"
+                } else {
+                    "denied"
+                }
+            );
+            print_scopes("Read", &settings.sandbox_read_paths);
+            print_scopes("Write", &settings.sandbox_write_paths);
+        }
+        SandboxCommand::Mode { mode, yes } => {
+            let mode = match mode {
+                SandboxModeArg::Auto => SandboxMode::Auto,
+                SandboxModeArg::Required => SandboxMode::Required,
+                SandboxModeArg::Off => {
+                    if !yes && !confirm("Disable OS-level command isolation?")? {
+                        println!("Sandbox unchanged");
+                        return Ok(());
+                    }
+                    SandboxMode::Off
+                }
+            };
+            settings.sandbox_mode = mode;
+            config::save_config_result(&settings)?;
+            println!("Sandbox: {}", sandbox_mode_name(mode));
+        }
+        SandboxCommand::Network { access } => {
+            settings.sandbox_network = matches!(access, NetworkAccessArg::Allow);
+            config::save_config_result(&settings)?;
+            println!(
+                "Sandbox network: {}",
+                if settings.sandbox_network {
+                    "allowed"
+                } else {
+                    "denied"
+                }
+            );
+        }
+        SandboxCommand::AddRead { path } => {
+            let path = normalized_scope(&path, false)?;
+            if !settings.sandbox_read_paths.contains(&path) {
+                settings.sandbox_read_paths.push(path.clone());
+            }
+            config::save_config_result(&settings)?;
+            println!("Read scope: {}", path.display());
+        }
+        SandboxCommand::AddWrite { path } => {
+            let path = normalized_scope(&path, true)?;
+            if !settings.sandbox_write_paths.contains(&path) {
+                settings.sandbox_write_paths.push(path.clone());
+            }
+            config::save_config_result(&settings)?;
+            println!("Write scope: {}", path.display());
+        }
+        SandboxCommand::ClearScopes => {
+            settings.sandbox_read_paths.clear();
+            settings.sandbox_write_paths.clear();
+            config::save_config_result(&settings)?;
+            println!("Additional sandbox scopes cleared");
+        }
+        SandboxCommand::Reset => {
+            let defaults = Config::default();
+            settings.sandbox_mode = defaults.sandbox_mode;
+            settings.sandbox_network = defaults.sandbox_network;
+            settings.sandbox_read_paths.clear();
+            settings.sandbox_write_paths.clear();
+            config::save_config_result(&settings)?;
+            println!("Sandbox reset to auto mode with network denied");
+        }
+    }
+    Ok(())
+}
+
+fn command_sandbox_policy(config: &Config, model_proposed: bool) -> Result<SandboxPolicy> {
+    if config.sandbox_mode == SandboxMode::Off {
+        return Ok(SandboxPolicy::disabled());
+    }
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    let mut scopes =
+        FilesystemScopes::new(&config.sandbox_read_paths, &config.sandbox_write_paths)?;
+    scopes.allow_write(&cwd)?;
+    add_runtime_read_scopes(&mut scopes)?;
+    let mut policy = SandboxPolicy::strict(scopes);
+    policy.mode = match config.sandbox_mode {
+        SandboxMode::Off => RuntimeSandboxMode::Disabled,
+        SandboxMode::Required => RuntimeSandboxMode::Strict,
+        SandboxMode::Auto if model_proposed => RuntimeSandboxMode::Strict,
+        SandboxMode::Auto => RuntimeSandboxMode::BestEffort,
+    };
+    policy.network = if config.sandbox_network {
+        NetworkScope::Allowed
+    } else {
+        NetworkScope::Denied
+    };
+    Ok(policy)
+}
+
+fn add_runtime_read_scopes(scopes: &mut FilesystemScopes) -> Result<()> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in
+            std::env::split_paths(&path).filter(|path| path.is_absolute() && path.exists())
+        {
+            scopes.allow_read(directory)?;
+        }
+    }
+    let home = dirs::home_dir();
+    for (variable, fallback) in [
+        ("NVM_DIR", ".nvm"),
+        ("PYENV_ROOT", ".pyenv"),
+        ("RUSTUP_HOME", ".rustup"),
+        ("VOLTA_HOME", ".volta"),
+    ] {
+        let path = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(fallback)));
+        if let Some(path) = path.filter(|path| path.is_absolute() && path.exists()) {
+            scopes.allow_read(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalized_scope(path: &Path, write: bool) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let scopes = if write {
+        FilesystemScopes::new(std::iter::empty::<&Path>(), [&absolute])?
+    } else {
+        FilesystemScopes::new([&absolute], std::iter::empty::<&Path>())?
+    };
+    Ok(if write {
+        scopes.writable_paths()[0].clone()
+    } else {
+        scopes.readable_paths()[0].clone()
+    })
+}
+
+fn sandbox_mode_name(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Auto => "auto",
+        SandboxMode::Required => "required",
+        SandboxMode::Off => "off",
+    }
+}
+
+fn print_scopes(label: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        println!("{label}: current working directory only");
+    } else {
+        for path in paths {
+            println!("{label}: {}", path.display());
+        }
+    }
+}
+
+fn print_optional_rate(label: &str, value: Option<f64>) {
+    if let Some(value) = value {
+        println!("{label}: {:.1}%", value * 100.0);
+    }
+}
+
+fn print_optional_duration(label: &str, value: Option<u128>) {
+    if let Some(value) = value {
+        println!("{label}: {value} ms");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1949,7 +2316,10 @@ mod tests {
             chat_id,
             repo: None,
         };
-        let config = Config::default();
+        let config = Config {
+            sandbox_mode: SandboxMode::Off,
+            ..Config::default()
+        };
         let allowed = vec!["printf eval-tool-ok".to_owned()];
         let executed = execute_tool(
             &conn,
@@ -2008,6 +2378,7 @@ mod tests {
         };
         let config = Config {
             model: "test/model".into(),
+            sandbox_mode: SandboxMode::Off,
             ..Config::default()
         };
         let allowed = vec!["printf assistant-tool-ok".to_owned()];
