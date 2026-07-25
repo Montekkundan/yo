@@ -22,6 +22,7 @@ fn offline_reliability_suite_runs_without_a_gateway_credential() {
     let output = Command::new(env!("CARGO_BIN_EXE_yo"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("YO_EVAL_REQUIRE_OFFLINE_TARGETS", "1")
         .env_remove("AI_GATEWAY_API_KEY")
         .env_remove("VERCEL_OIDC_TOKEN")
         .args(["eval", "offline", "--json"])
@@ -31,14 +32,18 @@ fn offline_reliability_suite_runs_without_a_gateway_credential() {
 
     assert!(
         output.status.success(),
-        "offline eval failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "offline eval failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(!stdout.contains("sk-live-cobalt719"));
     let report: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(report["failed"], 0);
-    assert_eq!(report["reliability"]["observed"]["memory_precision"], 1.0);
+    assert_eq!(
+        report["reliability"]["observed"]["memory_precision"], 1.0,
+        "unexpected offline report: {stdout}"
+    );
     assert_eq!(
         report["reliability"]["observed"]["secret_retention_failures"],
         0
