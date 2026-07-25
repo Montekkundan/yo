@@ -9,6 +9,7 @@
 use crate::sandbox::{self, CommandSpec, SandboxPolicy};
 use std::collections::VecDeque;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -939,14 +940,44 @@ fn is_shell_builtin(program: &str) -> bool {
     )
 }
 
-fn executable_on_path(program: &str) -> bool {
+pub(crate) fn executable_on_path(program: &str) -> bool {
     let path = Path::new(program);
     if path.components().count() > 1 {
         return path.is_file();
     }
+    let path_extensions = if cfg!(windows) {
+        env::var_os("PATHEXT").or_else(|| Some(OsString::from(".COM;.EXE;.BAT;.CMD")))
+    } else {
+        None
+    };
+    let names = executable_names(program, path_extensions.as_deref());
     env::split_paths(&env::var_os("PATH").unwrap_or_default())
-        .map(|directory| directory.join(program))
-        .any(|candidate| candidate.is_file())
+        .any(|directory| names.iter().any(|name| directory.join(name).is_file()))
+}
+
+fn executable_names(program: &str, path_extensions: Option<&OsStr>) -> Vec<OsString> {
+    let mut names = vec![OsString::from(program)];
+    if Path::new(program).extension().is_some() {
+        return names;
+    }
+    let Some(path_extensions) = path_extensions else {
+        return names;
+    };
+    for extension in path_extensions.to_string_lossy().split(';') {
+        let extension = extension.trim();
+        if extension.is_empty() {
+            continue;
+        }
+        let mut name = OsString::from(program);
+        if !extension.starts_with('.') {
+            name.push(".");
+        }
+        name.push(extension);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 fn read_bounded_tail_reporting<R, F>(
@@ -1851,6 +1882,21 @@ mod tests {
             RunInput::Argv(vec!["printf".into(), "%s".into(), "hello world".into()])
         );
         assert!(RunRequest::from_cli_args(Vec::<String>::new()).is_err());
+    }
+
+    #[test]
+    fn executable_names_expand_windows_path_extensions() {
+        assert_eq!(
+            executable_names("rustc", Some(OsStr::new(".COM;.EXE;.CMD"))),
+            vec!["rustc", "rustc.COM", "rustc.EXE", "rustc.CMD"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            executable_names("rustc.exe", Some(OsStr::new(".COM;.EXE"))),
+            vec![OsString::from("rustc.exe")]
+        );
     }
 
     #[cfg(unix)]

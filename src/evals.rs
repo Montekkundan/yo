@@ -541,15 +541,10 @@ async fn run_case(case: &EvalCase, gateway: Option<&GatewayClient>, config: &Con
 }
 
 fn missing_requirement(requirements: &[String]) -> Option<String> {
-    requirements.iter().find_map(|requirement| {
-        let request = terminal::RunRequest::shell_script(format!("command -v {requirement}"))
-            .ok()?
-            .with_timeout(std::time::Duration::from_secs(10));
-        match terminal::run_explicit(&request) {
-            Ok(result) if result.success => None,
-            _ => Some(requirement.clone()),
-        }
-    })
+    requirements
+        .iter()
+        .find(|requirement| !terminal::executable_on_path(requirement))
+        .cloned()
 }
 
 async fn execute_case(
