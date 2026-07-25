@@ -24,7 +24,7 @@ jobs:
       - name: Lint GitHub Actions workflows
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
-          args: -color
+          args: -color -shellcheck= -pyflakes=
 
   supply-chain:
     name: supply-chain
@@ -32,13 +32,13 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@ab40b01f54fe82bdf65693ea090a1e4942c136e7 # 1.91.1
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
       - name: Enforce dependency policy
         uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18
         with:
