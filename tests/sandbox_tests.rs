@@ -13,9 +13,11 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Duration;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use yo::sandbox::SandboxBackend;
 use yo::sandbox::{
-    prepare_with_backend, CommandSpec, FilesystemScopes, NetworkScope, SandboxBackend,
-    SandboxError, SandboxMode, SandboxPolicy,
+    prepare_with_backend, CommandSpec, FilesystemScopes, NetworkScope, SandboxError, SandboxMode,
+    SandboxPolicy,
 };
 
 fn existing_program() -> PathBuf {
@@ -239,7 +241,13 @@ fn os_sandbox_enforces_filesystem_network_and_environment_boundaries() {
         .into_command()
         .output()
         .unwrap();
-    assert!(allowed_output.status.success());
+    assert!(
+        allowed_output.status.success(),
+        "allowed sandbox command failed: status={:?}, stdout={}, stderr={}",
+        allowed_output.status.code(),
+        String::from_utf8_lossy(&allowed_output.stdout),
+        String::from_utf8_lossy(&allowed_output.stderr)
+    );
     assert_eq!(
         fs::read_to_string(allowed.join("created.txt")).unwrap(),
         "written"

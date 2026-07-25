@@ -59,7 +59,13 @@ jobs:
           components: rustfmt, clippy
       - name: Install Linux sandbox backend
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --die-with-parent --unshare-all --ro-bind / / -- true
       - name: Formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
