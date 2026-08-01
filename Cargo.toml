@@ -40,9 +40,9 @@ reqwest = { version = "0.12.15", default-features = false, features = ["json", "
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tokio = { version = "1.44.2", features = ["full"] }
-toml = "0.8.20"
+toml = "1.1.3"
 anyhow = "1.0.103"
-rusqlite = { version = "0.31", features = ["backup", "bundled"] }
+rusqlite = { version = "0.37", features = ["backup", "bundled"] }
 keyring = "4.1.5"
 rpassword = "7.5.4"
 termimad = "0.35.1"
@@ -51,9 +51,9 @@ crossterm = "0.29.0"
 flate2 = "1.1.9"
 semver = "1.0.28"
 self-replace = "1.5.0"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 tar = "0.4.46"
-zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tokio = { version = "1.44.2", features = ["full", "test-util"] }
