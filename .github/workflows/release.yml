@@ -164,11 +164,11 @@ jobs:
         mv sbom.cdx.json artifacts/sbom.cdx.json
         (cd artifacts && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
     - name: Attest build provenance
-      uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+      uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
       with:
         subject-checksums: artifacts/SHA256SUMS
     - name: Attest software bill of materials
-      uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+      uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
       with:
         subject-checksums: artifacts/SHA256SUMS
         sbom-path: artifacts/sbom.cdx.json
